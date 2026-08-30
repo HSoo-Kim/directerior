@@ -400,6 +400,46 @@ def test_cross_volume_remove_recovers_after_verified_copy(
     assert copy_calls == 1
 
 
+def test_offloaded_remove_recovers_after_saved_hdd_trashed_state(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("DIRECTERIOR_STATE_HOME", str(tmp_path / "state"))
+    leaf = project / "methods" / "lora" / "experiments" / "exp01"
+    results = leaf / "results"
+    (results / "data.bin").write_bytes(b"payload")
+    offload(["lora", "exp01"], True)
+    original_save = directerior_ops.save_operation_record
+    fired = False
+
+    def save_then_fail(record: OperationRecord) -> None:
+        nonlocal fired
+        original_save(record)
+        if not fired and record.state == "hdd_trashed":
+            fired = True
+            raise InjectedFailure("after saved hdd_trashed")
+
+    monkeypatch.setattr(directerior_ops, "save_operation_record", save_then_fail)
+
+    with pytest.raises(InjectedFailure, match="after saved hdd_trashed"):
+        remove_experiment(["lora", "exp01"], True)
+
+    interrupted = _latest(project)
+    target = Path(str(interrupted.details["target"]))
+    local_trash = Path(str(interrupted.details["local_trash"]))
+    hdd_trash = Path(str(interrupted.details["hdd_trash"]))
+    assert interrupted.state == "hdd_trashed"
+    assert directerior_ops.link_target(results) == target.resolve(strict=False)
+    assert (hdd_trash / "data.bin").read_bytes() == b"payload"
+
+    recovered = recover_operation(project, interrupted.operation_id, True)
+
+    assert recovered.state == "committed"
+    assert not leaf.exists()
+    assert local_trash.is_dir()
+    assert (hdd_trash / "data.bin").read_bytes() == b"payload"
+
+
 @pytest.mark.parametrize("state", ["prepared", "hdd_trashed", "local_trashed"])
 def test_remove_recovers_after_each_boundary(
     project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str

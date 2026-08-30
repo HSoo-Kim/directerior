@@ -755,9 +755,9 @@ def _preflight_remove(
         and _matches_tree_no_follow_excluding(leaf, local_snapshot, results)
         and _absent(results)
     )
-    local_source_exact = local_unlinked if offloaded else local_linked
-    local_before = local_source_exact and _absent(local_trash)
-    local_copied = local_source_exact and _matches_tree_no_follow(
+    local_before = (local_linked or local_unlinked) and _absent(local_trash)
+    copied_source = local_unlinked if offloaded else local_linked
+    local_copied = copied_source and _matches_tree_no_follow(
         local_trash, local_snapshot
     )
     local_after = _absent(leaf) and _matches_tree_no_follow(
