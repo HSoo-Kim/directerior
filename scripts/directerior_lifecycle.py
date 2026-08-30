@@ -168,16 +168,18 @@ def clean(fix: bool) -> int:
     for leaf in iter_leaves(root, config):
         results = section_path(leaf, config, "results")
         expected = hdd_results_path(config, root, leaf.names)
-        managed_targets.add(expected.resolve(strict=False))
         actual = link_target(results)
 
         if expected.is_dir():
-            if actual == expected.resolve(strict=False):
+            resolved_expected = expected.resolve(strict=False)
+            if actual == resolved_expected:
+                managed_targets.add(resolved_expected)
                 continue
             if results.exists() and not is_offloaded(results):
                 unresolved += 1
                 print(f"CONFLICT: {leaf.label}; regular path blocks link repair: {results}")
                 continue
+            managed_targets.add(resolved_expected)
             if not fix:
                 unresolved += 1
                 print(f"REPAIRABLE LINK: {leaf.label}; expected target: {expected}")

@@ -15,6 +15,16 @@ class InjectedFailure(RuntimeError):
     pass
 
 
+RENAME_STATES = [
+    "prepared",
+    "link_removed",
+    "local_renamed",
+    "hdd_renamed",
+    "linked",
+    "manifest_updated",
+]
+
+
 def _fail_after_state(monkeypatch: pytest.MonkeyPatch, state: str) -> None:
     original = directerior_ops.save_operation_record
     fired = False
@@ -99,17 +109,7 @@ def test_restore_recovers_after_each_boundary(
     assert (results / "data.bin").read_bytes() == b"payload"
 
 
-@pytest.mark.parametrize(
-    "state",
-    [
-        "prepared",
-        "link_removed",
-        "local_renamed",
-        "hdd_renamed",
-        "linked",
-        "manifest_updated",
-    ],
-)
+@pytest.mark.parametrize("state", RENAME_STATES)
 def test_rename_recovers_after_each_boundary(
     project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
 ) -> None:
@@ -140,6 +140,74 @@ def test_rename_recovers_after_each_boundary(
     assert recovered.state == "committed"
     assert not old.exists()
     assert (new / "results" / "data.bin").read_bytes() == b"payload"
+
+
+@pytest.mark.parametrize("state", RENAME_STATES)
+def test_rename_recovery_refuses_modified_local_tree(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("DIRECTERIOR_STATE_HOME", str(tmp_path / "state"))
+    old = project / "methods" / "lora" / "experiments" / "exp01"
+    new = project / "methods" / "lora" / "experiments" / "exp02"
+    script = old / "code" / "train.py"
+    script.write_text("original\n", encoding="utf-8")
+    _fail_after_state(monkeypatch, state)
+
+    with pytest.raises(InjectedFailure):
+        rename_experiment(["lora", "exp01"], ["lora", "exp02"], True)
+
+    interrupted = _latest(project)
+    current = old if old.exists() else new
+    changed = current / "code" / "train.py"
+    changed.write_text("changed\n", encoding="utf-8")
+    positions = (old.exists(), new.exists())
+
+    with pytest.raises(DirecteriorError, match="recovery conflict"):
+        recover_operation(project, interrupted.operation_id, True)
+
+    assert (old.exists(), new.exists()) == positions
+    assert changed.read_text(encoding="utf-8") == "changed\n"
+
+
+@pytest.mark.parametrize("state", RENAME_STATES)
+def test_rename_recovery_refuses_modified_hdd_tree(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("DIRECTERIOR_STATE_HOME", str(tmp_path / "state"))
+    old = project / "methods" / "lora" / "experiments" / "exp01"
+    new = project / "methods" / "lora" / "experiments" / "exp02"
+    (old / "results" / "data.bin").write_bytes(b"original")
+    offload(["lora", "exp01"], True)
+    _fail_after_state(monkeypatch, state)
+
+    with pytest.raises(InjectedFailure):
+        rename_experiment(["lora", "exp01"], ["lora", "exp02"], True)
+
+    interrupted = _latest(project)
+    old_target = Path(str(interrupted.details["old_target"]))
+    new_target = Path(str(interrupted.details["new_target"]))
+    current_target = old_target if old_target.exists() else new_target
+    changed = current_target / "data.bin"
+    changed.write_bytes(b"changed")
+    positions = (
+        old.exists(),
+        new.exists(),
+        old_target.exists(),
+        new_target.exists(),
+    )
+
+    with pytest.raises(DirecteriorError, match="recovery conflict"):
+        recover_operation(project, interrupted.operation_id, True)
+
+    assert (
+        old.exists(),
+        new.exists(),
+        old_target.exists(),
+        new_target.exists(),
+    ) == positions
+    assert changed.read_bytes() == b"changed"
 
 
 @pytest.mark.parametrize(

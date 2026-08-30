@@ -4,6 +4,7 @@ import hashlib
 import os
 import shutil
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -78,7 +79,16 @@ def _entry_is_link(entry: os.DirEntry[str]) -> bool:
         return True
 
 
-def tree_snapshot_no_follow(path: Path, exclude: Path | None = None) -> TreeSnapshot:
+def tree_snapshot_no_follow(
+    path: Path, exclude: Path | Collection[Path] | None = None
+) -> TreeSnapshot:
+    excluded = (
+        frozenset()
+        if exclude is None
+        else frozenset((exclude,))
+        if isinstance(exclude, Path)
+        else frozenset(exclude)
+    )
     digest = hashlib.sha256()
     file_count = 0
     byte_count = 0
@@ -88,7 +98,7 @@ def tree_snapshot_no_follow(path: Path, exclude: Path | None = None) -> TreeSnap
         entries = sorted(os.scandir(current), key=lambda entry: entry.name, reverse=True)
         for entry in entries:
             entry_path = Path(entry.path)
-            if exclude is not None and entry_path == exclude:
+            if entry_path in excluded:
                 continue
             relative = entry_path.relative_to(path).as_posix()
             if _entry_is_link(entry):

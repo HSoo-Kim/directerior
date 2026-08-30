@@ -77,6 +77,7 @@ def test_clean_fix_reports_regular_directory_conflict(numbered_project: Path) ->
 
     assert result.returncode == 2
     assert f"regular path blocks link repair: {results}" in result.stdout
+    assert f"ORPHAN ON HDD: {target}" in result.stdout
     assert (results / "local.bin").read_bytes() == b"local"
     assert (target / "remote.bin").read_bytes() == b"remote"
 

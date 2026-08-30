@@ -319,6 +319,19 @@ def _update_manifest(path: Path, hierarchy: list[str], names: list[str]) -> None
     )
 
 
+def _matches_tree_no_follow_excluding(
+    path: Path, snapshot: TreeSnapshot, exclude: Path | tuple[Path, ...] | None = None
+) -> bool:
+    try:
+        return (
+            path.is_dir()
+            and not is_offloaded(path)
+            and tree_snapshot_no_follow(path, exclude) == snapshot
+        )
+    except OSError:
+        return False
+
+
 def start_rename(
     root: Path,
     config: Config,
@@ -335,7 +348,14 @@ def start_rename(
         require_plain_tree(old_target, "rename")
     else:
         require_plain_tree(old_leaf, "rename")
-    snapshot = tree_snapshot(old_target if offloaded else old_leaf)
+    local_snapshot = tree_snapshot_no_follow(old_leaf)
+    unlinked_snapshot = (
+        tree_snapshot_no_follow(old_leaf, old_results) if offloaded else local_snapshot
+    )
+    manifest = old_leaf / "manifest.json"
+    content_exclusions = (manifest, old_results) if offloaded else (manifest,)
+    content_snapshot = tree_snapshot_no_follow(old_leaf, content_exclusions)
+    hdd_snapshot = tree_snapshot(old_target) if offloaded else None
     record = _new_record(
         root,
         "rename",
@@ -348,7 +368,11 @@ def start_rename(
             "new_results": str(new_leaf / config.sections["results"]),
             "old_target": str(old_target),
             "new_target": str(new_target),
-            "snapshot": asdict(snapshot),
+            "snapshot": asdict(hdd_snapshot if hdd_snapshot is not None else local_snapshot),
+            "local_snapshot": asdict(local_snapshot),
+            "unlinked_snapshot": asdict(unlinked_snapshot),
+            "content_snapshot": asdict(content_snapshot),
+            "hdd_snapshot": asdict(hdd_snapshot) if hdd_snapshot is not None else None,
             "offloaded": offloaded,
             "hierarchy": list(config.hierarchy),
             "hdd_root": str(config.hdd_root),
@@ -365,51 +389,134 @@ def continue_rename(record: OperationRecord) -> OperationRecord:
     new_results = _path(record, "new_results")
     old_target = _path(record, "old_target")
     new_target = _path(record, "new_target")
-    snapshot = _snapshot(record)
+    if not all(
+        name in record.details
+        for name in ("local_snapshot", "unlinked_snapshot", "content_snapshot")
+    ):
+        raise DirecteriorError(
+            "rename journal lacks exact local snapshots; refusing unsafe recovery"
+        )
+    local_snapshot = _named_snapshot(record, "local_snapshot")
+    unlinked_snapshot = _named_snapshot(record, "unlinked_snapshot")
+    content_snapshot = _named_snapshot(record, "content_snapshot")
     offloaded = record.details.get("offloaded") is True
+    hdd_snapshot = _named_snapshot(record, "hdd_snapshot") if offloaded else None
     hierarchy = _strings(record, "hierarchy")
     new_names = _strings(record, "new_names")
+    new_manifest = new_leaf / "manifest.json"
+    new_content_exclusions = (
+        (new_manifest, new_results) if offloaded else (new_manifest,)
+    )
+
+    def old_hdd_ready() -> bool:
+        return (
+            not offloaded
+            or hdd_snapshot is not None
+            and _matches_tree(old_target, hdd_snapshot)
+            and _absent(new_target)
+        )
+
+    def new_hdd_ready() -> bool:
+        return (
+            not offloaded
+            or hdd_snapshot is not None
+            and _matches_tree(new_target, hdd_snapshot)
+            and _absent(old_target)
+        )
+
+    def old_unlinked_ready() -> bool:
+        return _matches_tree_no_follow_excluding(
+            old_leaf,
+            unlinked_snapshot,
+            old_results if offloaded else None,
+        )
+
+    def new_unlinked_ready() -> bool:
+        return _matches_tree_no_follow_excluding(
+            new_leaf,
+            unlinked_snapshot,
+            new_results if offloaded else None,
+        )
+
     while record.state != "committed":
         if record.state == "prepared":
+            if not old_hdd_ready() or not _absent(new_leaf):
+                raise _conflict(record, old_leaf, new_leaf, old_target, new_target)
             if offloaded:
-                if link_target(old_results) == old_target.resolve(strict=False):
+                if _matches_tree_no_follow(old_leaf, local_snapshot):
+                    if link_target(old_results) != old_target.resolve(strict=False):
+                        raise _conflict(record, old_results, old_target)
                     remove_link(old_results)
-                elif not (_absent(old_results) and old_leaf.is_dir()):
-                    raise _conflict(record, old_results, old_target)
+                elif not old_unlinked_ready():
+                    raise _conflict(record, old_leaf, old_results)
+            elif not _matches_tree_no_follow(old_leaf, local_snapshot):
+                raise _conflict(record, old_leaf)
             record = _save(record, "link_removed")
         elif record.state == "link_removed":
-            if old_leaf.is_dir() and _absent(new_leaf):
+            if not old_hdd_ready():
+                raise _conflict(record, old_target, new_target)
+            if old_unlinked_ready() and _absent(new_leaf):
                 new_leaf.parent.mkdir(parents=True, exist_ok=True)
                 old_leaf.rename(new_leaf)
-            elif not (new_leaf.is_dir() and _absent(old_leaf)):
+            elif not (new_unlinked_ready() and _absent(old_leaf)):
                 raise _conflict(record, old_leaf, new_leaf)
             record = _save(record, "local_renamed")
         elif record.state == "local_renamed":
+            if not (new_unlinked_ready() and _absent(old_leaf)):
+                raise _conflict(record, old_leaf, new_leaf)
             if offloaded:
-                if _matches_tree(old_target, snapshot) and _absent(new_target):
+                if old_hdd_ready():
                     new_target.parent.mkdir(parents=True, exist_ok=True)
                     old_target.rename(new_target)
-                elif not (_matches_tree(new_target, snapshot) and _absent(old_target)):
+                elif not new_hdd_ready():
                     raise _conflict(record, old_target, new_target)
             record = _save(record, "hdd_renamed")
         elif record.state == "hdd_renamed":
+            if not new_hdd_ready() or not _absent(old_leaf):
+                raise _conflict(record, old_leaf, new_leaf, old_target, new_target)
             if offloaded:
-                if _absent(new_results) and _matches_tree(new_target, snapshot):
+                if new_unlinked_ready() and _absent(new_results):
                     make_link(new_results, new_target)
-                elif link_target(new_results) != new_target.resolve(strict=False):
-                    raise _conflict(record, new_results, new_target)
+                elif not (
+                    link_target(new_results) == new_target.resolve(strict=False)
+                    and _matches_tree_no_follow_excluding(
+                        new_leaf, unlinked_snapshot, new_results
+                    )
+                ):
+                    raise _conflict(record, new_leaf, new_results, new_target)
+            elif not _matches_tree_no_follow(new_leaf, local_snapshot):
+                raise _conflict(record, new_leaf)
             record = _save(record, "linked")
         elif record.state == "linked":
-            if not new_leaf.is_dir() or (
+            if not new_hdd_ready() or (
                 offloaded and link_target(new_results) != new_target.resolve(strict=False)
             ):
-                raise _conflict(record, new_leaf, new_results)
-            if not _manifest_matches(new_leaf, hierarchy, new_names):
+                raise _conflict(record, new_leaf, new_results, new_target)
+            if _manifest_matches(new_leaf, hierarchy, new_names):
+                if not _matches_tree_no_follow_excluding(
+                    new_leaf, content_snapshot, new_content_exclusions
+                ):
+                    raise _conflict(record, new_leaf)
+            else:
+                if not _matches_tree_no_follow_excluding(
+                    new_leaf,
+                    unlinked_snapshot,
+                    new_results if offloaded else None,
+                ):
+                    raise _conflict(record, new_leaf)
                 _update_manifest(new_leaf, hierarchy, new_names)
             record = _save(record, "manifest_updated")
         elif record.state == "manifest_updated":
-            if not _manifest_matches(new_leaf, hierarchy, new_names):
-                raise _conflict(record, new_leaf / "manifest.json")
+            if (
+                not new_hdd_ready()
+                or offloaded
+                and link_target(new_results) != new_target.resolve(strict=False)
+                or not _manifest_matches(new_leaf, hierarchy, new_names)
+                or not _matches_tree_no_follow_excluding(
+                    new_leaf, content_snapshot, new_content_exclusions
+                )
+            ):
+                raise _conflict(record, new_leaf, new_results, new_target)
             record = _save(record, "committed")
         else:
             raise _conflict(record, old_leaf, new_leaf)
