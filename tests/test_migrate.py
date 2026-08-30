@@ -11,7 +11,7 @@ from directerior_history import MigrationRecord, load_record
 from directerior_lifecycle import offload
 from directerior_migrate import migrate_layout, redo_migration, undo_migration
 from directerior_ops import recover_operation
-from directerior_storage import link_target
+from directerior_storage import link_target, make_link, remove_link
 
 
 def state_env(tmp_path: Path) -> dict[str, str]:
@@ -311,6 +311,67 @@ def test_offloaded_undo_redo_restores_hdd_paths(project: Path, tmp_path: Path) -
     assert not old_target.exists()
     assert (new_target / "artifact.bin").read_bytes() == b"payload"
     assert (leaf / "3_results" / "artifact.bin").read_bytes() == b"payload"
+
+
+def test_undo_refuses_retargeted_results_link_without_mutation(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DIRECTERIOR_STATE_HOME", str(tmp_path / "state"))
+    env = state_env(tmp_path)
+    leaf = project / "methods" / "lora" / "experiments" / "exp01"
+    (leaf / "results" / "artifact.bin").write_bytes(b"payload")
+    assert run_cli(project, "offload", "lora", "exp01", "--yes", env=env).returncode == 0
+    assert run_cli(project, "migrate-layout", "--yes", env=env).returncode == 0
+    operation_id = latest_history_id(project, env)
+    record = load_record(project, operation_id)
+    results = leaf / "3_results"
+    expected_target = Path(record.leaves[0].new_hdd_target)
+    alternate = tmp_path / "alternate-undo"
+    alternate.mkdir()
+    remove_link(results)
+    make_link(results, alternate)
+    config_before = (project / ".expman.json").read_bytes()
+
+    completed = run_cli(project, "undo", operation_id, "--yes", env=env)
+
+    assert completed.returncode == 1
+    assert "changed since migration" in completed.stderr
+    assert link_target(results) == alternate.resolve()
+    assert (expected_target / "artifact.bin").read_bytes() == b"payload"
+    assert (project / ".expman.json").read_bytes() == config_before
+    assert (leaf / "1_plan").is_dir()
+    assert (leaf / "2_code").is_dir()
+
+
+def test_redo_refuses_retargeted_results_link_without_mutation(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DIRECTERIOR_STATE_HOME", str(tmp_path / "state"))
+    env = state_env(tmp_path)
+    leaf = project / "methods" / "lora" / "experiments" / "exp01"
+    (leaf / "results" / "artifact.bin").write_bytes(b"payload")
+    assert run_cli(project, "offload", "lora", "exp01", "--yes", env=env).returncode == 0
+    assert run_cli(project, "migrate-layout", "--yes", env=env).returncode == 0
+    operation_id = latest_history_id(project, env)
+    record = load_record(project, operation_id)
+    assert run_cli(project, "undo", operation_id, "--yes", env=env).returncode == 0
+    results = leaf / "results"
+    expected_target = Path(record.leaves[0].old_hdd_target)
+    alternate = tmp_path / "alternate-redo"
+    alternate.mkdir()
+    remove_link(results)
+    make_link(results, alternate)
+    config_before = (project / ".expman.json").read_bytes()
+
+    completed = run_cli(project, "redo", operation_id, "--yes", env=env)
+
+    assert completed.returncode == 1
+    assert "changed since undo" in completed.stderr
+    assert link_target(results) == alternate.resolve()
+    assert (expected_target / "artifact.bin").read_bytes() == b"payload"
+    assert (project / ".expman.json").read_bytes() == config_before
+    assert (leaf / "code").is_dir()
+    assert not (leaf / "1_plan").exists()
 
 
 def test_prepared_migration_conflict_does_not_mutate_project(

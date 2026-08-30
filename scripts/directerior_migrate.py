@@ -293,6 +293,15 @@ def _leaf_applied(root: Path, leaf: LeafMigration) -> bool:
     )
 
 
+def _leaf_original(root: Path, leaf: LeafMigration) -> bool:
+    old_code, old_results, plan, new_code, new_results, _base = _paths(root, leaf)
+    return (
+        _missing(plan)
+        and _code_before(old_code, new_code, leaf)
+        and _results_before(old_results, new_results, leaf)
+    )
+
+
 def _preflight_migration(root: Path, record: MigrationRecord) -> None:
     config_path = root / CONFIG_NAME
     current_config = config_path.read_bytes()
@@ -490,18 +499,7 @@ def _verify_applied(root: Path, record: MigrationRecord) -> None:
     if (root / CONFIG_NAME).read_bytes() != record.after_config:
         raise DirecteriorError("project config changed since migration")
     for leaf in record.leaves:
-        old_code, old_results, plan, new_code, new_results, _base = _paths(root, leaf)
-        result_data = Path(leaf.new_hdd_target) if leaf.offloaded else new_results
-        plan_matches = leaf.plan_snapshot is not None and _matches(plan, leaf.plan_snapshot)
-        link_matches = not leaf.offloaded or is_offloaded(new_results)
-        if (
-            old_code.exists()
-            or old_results.exists()
-            or not _matches(new_code, leaf.code_snapshot)
-            or not _matches(result_data, leaf.results_snapshot)
-            or not plan_matches
-            or not link_matches
-        ):
+        if not _leaf_applied(root, leaf):
             raise DirecteriorError(f"changed since migration: {'/'.join(leaf.names)}")
 
 
@@ -509,27 +507,7 @@ def _verify_undone(root: Path, record: MigrationRecord) -> None:
     if (root / CONFIG_NAME).read_bytes() != record.before_config:
         raise DirecteriorError("project config changed since undo")
     for leaf in record.leaves:
-        old_code, old_results, plan, new_code, new_results, _base = _paths(root, leaf)
-        result_data = Path(leaf.old_hdd_target) if leaf.offloaded else old_results
-        code_matches = (
-            _matches(old_code, leaf.code_snapshot)
-            if leaf.code_existed
-            else not old_code.exists()
-        )
-        result_matches = (
-            _matches(result_data, leaf.results_snapshot)
-            if leaf.results_existed
-            else not old_results.exists()
-        )
-        link_matches = not leaf.offloaded or is_offloaded(old_results)
-        if (
-            plan.exists()
-            or new_code.exists()
-            or new_results.exists()
-            or not code_matches
-            or not result_matches
-            or not link_matches
-        ):
+        if not _leaf_original(root, leaf):
             raise DirecteriorError(f"changed since undo: {'/'.join(leaf.names)}")
 
 
