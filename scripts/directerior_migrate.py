@@ -149,7 +149,10 @@ def _paths(root: Path, leaf: LeafMigration) -> tuple[Path, Path, Path, Path, Pat
 
 
 def _matches(path: Path, expected: TreeSnapshot) -> bool:
-    return path.is_dir() and tree_snapshot(path) == expected
+    try:
+        return path.is_dir() and not is_offloaded(path) and tree_snapshot(path) == expected
+    except (OSError, DirecteriorError):
+        return False
 
 
 def _plan_complete(path: Path) -> bool:
@@ -189,9 +192,180 @@ def _migration_conflict(
     )
 
 
+def _missing(path: Path) -> bool:
+    return not path.exists() and not is_offloaded(path)
+
+
+def _code_before(old_code: Path, new_code: Path, leaf: LeafMigration) -> bool:
+    old_ready = (
+        _matches(old_code, leaf.code_snapshot)
+        if leaf.code_existed
+        else _missing(old_code)
+    )
+    return old_ready and _missing(new_code)
+
+
+def _code_after(old_code: Path, new_code: Path, leaf: LeafMigration) -> bool:
+    return _missing(old_code) and _matches(new_code, leaf.code_snapshot)
+
+
+def _results_before(
+    old_results: Path, new_results: Path, leaf: LeafMigration
+) -> bool:
+    if leaf.offloaded:
+        old_target = Path(leaf.old_hdd_target)
+        new_target = Path(leaf.new_hdd_target)
+        return (
+            link_target(old_results) == old_target.resolve(strict=False)
+            and _matches(old_target, leaf.results_snapshot)
+            and _missing(new_results)
+            and _missing(new_target)
+        )
+    old_ready = (
+        _matches(old_results, leaf.results_snapshot)
+        if leaf.results_existed
+        else _missing(old_results)
+    )
+    return old_ready and _missing(new_results)
+
+
+def _results_after(
+    old_results: Path,
+    new_results: Path,
+    leaf: LeafMigration,
+    *,
+    linked: bool,
+) -> bool:
+    if leaf.offloaded:
+        old_target = Path(leaf.old_hdd_target)
+        new_target = Path(leaf.new_hdd_target)
+        link_ready = (
+            link_target(new_results) == new_target.resolve(strict=False)
+            if linked
+            else _missing(new_results)
+        )
+        return (
+            _missing(old_results)
+            and _missing(old_target)
+            and _matches(new_target, leaf.results_snapshot)
+            and link_ready
+        )
+    return _missing(old_results) and _matches(new_results, leaf.results_snapshot)
+
+
+def _results_transition_ready(
+    old_results: Path, new_results: Path, leaf: LeafMigration
+) -> bool:
+    if not leaf.offloaded:
+        return _results_before(old_results, new_results, leaf) or _results_after(
+            old_results, new_results, leaf, linked=False
+        )
+    old_target = Path(leaf.old_hdd_target)
+    new_target = Path(leaf.new_hdd_target)
+    link_removed = (
+        _missing(old_results)
+        and _matches(old_target, leaf.results_snapshot)
+        and _missing(new_target)
+        and _missing(new_results)
+    )
+    return (
+        _results_before(old_results, new_results, leaf)
+        or link_removed
+        or _results_after(old_results, new_results, leaf, linked=False)
+    )
+
+
+def _plan_ready(plan: Path, leaf: LeafMigration) -> bool:
+    return leaf.plan_snapshot is not None and _matches(plan, leaf.plan_snapshot)
+
+
+def _leaf_applied(root: Path, leaf: LeafMigration) -> bool:
+    old_code, old_results, plan, new_code, new_results, _base = _paths(root, leaf)
+    return (
+        _plan_ready(plan, leaf)
+        and _code_after(old_code, new_code, leaf)
+        and _results_after(
+            old_results,
+            new_results,
+            leaf,
+            linked=leaf.offloaded,
+        )
+    )
+
+
+def _preflight_migration(root: Path, record: MigrationRecord) -> None:
+    config_path = root / CONFIG_NAME
+    current_config = config_path.read_bytes()
+    leaves_complete = record.next_leaf_index == len(record.leaves)
+    config_ready = (
+        current_config == record.after_config
+        if record.leaf_state == "config_replaced"
+        else current_config in {record.before_config, record.after_config}
+        if leaves_complete and record.leaf_state == "prepared"
+        else current_config == record.before_config
+    )
+    if not config_ready:
+        raise _migration_conflict(record, None, config_path)
+
+    for index, leaf in enumerate(record.leaves):
+        old_code, old_results, plan, new_code, new_results, base = _paths(root, leaf)
+        if index < record.next_leaf_index:
+            ready = _leaf_applied(root, leaf)
+        elif index > record.next_leaf_index:
+            ready = (
+                _missing(plan)
+                and _code_before(old_code, new_code, leaf)
+                and _results_before(old_results, new_results, leaf)
+            )
+        elif record.leaf_state == "prepared":
+            ready = (
+                (_missing(plan) or _plan_complete(plan))
+                and _code_before(old_code, new_code, leaf)
+                and _results_before(old_results, new_results, leaf)
+            )
+        elif record.leaf_state == "plan_created":
+            ready = (
+                _plan_ready(plan, leaf)
+                and (
+                    _code_before(old_code, new_code, leaf)
+                    or _code_after(old_code, new_code, leaf)
+                )
+                and _results_before(old_results, new_results, leaf)
+            )
+        elif record.leaf_state == "code_renamed":
+            ready = (
+                _plan_ready(plan, leaf)
+                and _code_after(old_code, new_code, leaf)
+                and _results_transition_ready(old_results, new_results, leaf)
+            )
+        elif record.leaf_state == "results_renamed":
+            ready = (
+                _plan_ready(plan, leaf)
+                and _code_after(old_code, new_code, leaf)
+                and (
+                    _results_after(old_results, new_results, leaf, linked=False)
+                    or leaf.offloaded
+                    and _results_after(old_results, new_results, leaf, linked=True)
+                )
+            )
+        elif record.leaf_state == "linked":
+            ready = _leaf_applied(root, leaf)
+        else:
+            ready = False
+        if not ready:
+            raise _migration_conflict(
+                record,
+                leaf,
+                base,
+                Path(leaf.old_hdd_target),
+                Path(leaf.new_hdd_target),
+            )
+
+
 def continue_migration(root: Path, record: MigrationRecord) -> MigrationRecord:
     if record.state != "prepared":
         raise DirecteriorError(f"cannot recover migration in state: {record.state}")
+    _preflight_migration(root, record)
     while record.next_leaf_index < len(record.leaves):
         index = record.next_leaf_index
         leaf = record.leaves[index]

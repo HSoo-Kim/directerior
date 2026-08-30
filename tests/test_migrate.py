@@ -6,6 +6,7 @@ from pathlib import Path
 import directerior_migrate
 import pytest
 from conftest import run_cli
+from directerior_core import DirecteriorError
 from directerior_history import MigrationRecord, load_record
 from directerior_lifecycle import offload
 from directerior_migrate import migrate_layout, redo_migration, undo_migration
@@ -21,6 +22,17 @@ def latest_history_id(project: Path, env: dict[str, str]) -> str:
     completed = run_cli(project, "history", "--json", env=env)
     assert completed.returncode == 0
     return json.loads(completed.stdout)["entries"][0]["id"]
+
+
+def tree_bytes(root: Path) -> dict[str, tuple[str, bytes | None]]:
+    state: dict[str, tuple[str, bytes | None]] = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        if path.is_file():
+            state[relative] = ("file", path.read_bytes())
+        elif path.is_dir():
+            state[relative] = ("dir", None)
+    return state
 
 
 def test_migrate_dry_run_changes_nothing(project: Path, tmp_path: Path) -> None:
@@ -299,6 +311,45 @@ def test_offloaded_undo_redo_restores_hdd_paths(project: Path, tmp_path: Path) -
     assert not old_target.exists()
     assert (new_target / "artifact.bin").read_bytes() == b"payload"
     assert (leaf / "3_results" / "artifact.bin").read_bytes() == b"payload"
+
+
+def test_prepared_migration_conflict_does_not_mutate_project(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("DIRECTERIOR_STATE_HOME", str(tmp_path / "state"))
+    leaf = project / "methods" / "lora" / "experiments" / "exp01"
+    code = leaf / "code" / "train.py"
+    code.write_bytes(b"recorded code")
+    (leaf / "results" / "artifact.bin").write_bytes(b"payload")
+    original_save = directerior_migrate.save_record
+    fired = False
+
+    def fail_after_prepared_save(record: MigrationRecord) -> None:
+        nonlocal fired
+        original_save(record)
+        if not fired and record.leaf_state == "prepared":
+            fired = True
+            raise RuntimeError("injected prepared interruption")
+
+    monkeypatch.setattr(
+        directerior_migrate,
+        "save_record",
+        fail_after_prepared_save,
+    )
+
+    with pytest.raises(RuntimeError, match="injected prepared interruption"):
+        migrate_layout(True)
+
+    interrupted = load_record(project, "latest")
+    code.write_bytes(b"changed after journal")
+    before_recovery = tree_bytes(project)
+
+    with pytest.raises(DirecteriorError, match="migration recovery conflict"):
+        recover_operation(project, interrupted.operation_id, True)
+
+    assert tree_bytes(project) == before_recovery
+    assert not (leaf / "1_plan").exists()
 
 
 def test_multileaf_migration_recovers_second_leaf_then_undoes_and_redoes(
