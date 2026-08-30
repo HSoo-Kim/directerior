@@ -755,9 +755,10 @@ def _preflight_remove(
         and _matches_tree_no_follow_excluding(leaf, local_snapshot, results)
         and _absent(results)
     )
-    local_before = (
-        (local_linked or local_unlinked)
-        and _absent(local_trash)
+    local_source_exact = local_unlinked if offloaded else local_linked
+    local_before = local_source_exact and _absent(local_trash)
+    local_copied = local_source_exact and _matches_tree_no_follow(
+        local_trash, local_snapshot
     )
     local_after = _absent(leaf) and _matches_tree_no_follow(
         local_trash, local_snapshot
@@ -766,7 +767,7 @@ def _preflight_remove(
         "prepared": (hdd_before or hdd_after)
         and local_linked
         and _absent(local_trash),
-        "hdd_trashed": hdd_after and (local_before or local_after),
+        "hdd_trashed": hdd_after and (local_before or local_copied or local_after),
         "local_trashed": hdd_after and local_after,
     }.get(record.state, False)
     if not ready:
@@ -836,6 +837,9 @@ def continue_remove(record: OperationRecord) -> OperationRecord:
             next_ready = _absent(leaf) and _matches_tree_no_follow(
                 local_trash, local_snapshot
             )
+            copied_ready = _matches_tree_no_follow(
+                leaf, local_snapshot
+            ) and _matches_tree_no_follow(local_trash, local_snapshot)
             if not hdd_ready:
                 raise _conflict(record, target, hdd_trash)
             if source_ready:
@@ -845,6 +849,8 @@ def continue_remove(record: OperationRecord) -> OperationRecord:
                 else:
                     copy_tree_verified(leaf, local_trash, "rm")
                     shutil.rmtree(leaf)
+            elif copied_ready:
+                shutil.rmtree(leaf)
             elif not next_ready:
                 raise _conflict(record, leaf, local_trash)
             record = _save(record, "local_trashed")

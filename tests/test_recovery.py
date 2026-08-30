@@ -359,6 +359,47 @@ def test_remove_preflight_refuses_changed_local_tree_without_mutation(
     assert _latest(project).state == "prepared"
 
 
+def test_cross_volume_remove_recovers_after_verified_copy(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("DIRECTERIOR_STATE_HOME", str(tmp_path / "state"))
+    leaf = project / "methods" / "lora" / "experiments" / "exp01"
+    (leaf / "results" / "data.bin").write_bytes(b"payload")
+    original_copy = directerior_ops.copy_tree_verified
+    copy_calls = 0
+    fired = False
+
+    def copy_then_fail(source: Path, target: Path, operation: str = "copy"):
+        nonlocal copy_calls, fired
+        snapshot = original_copy(source, target, operation)
+        if operation == "rm":
+            copy_calls += 1
+            if not fired:
+                fired = True
+                raise InjectedFailure("after verified rm copy")
+        return snapshot
+
+    monkeypatch.setattr(directerior_ops, "same_volume", lambda *_args: False)
+    monkeypatch.setattr(directerior_ops, "copy_tree_verified", copy_then_fail)
+
+    with pytest.raises(InjectedFailure, match="after verified rm copy"):
+        remove_experiment(["lora", "exp01"], True)
+
+    interrupted = _latest(project)
+    local_trash = Path(str(interrupted.details["local_trash"]))
+    assert interrupted.state == "hdd_trashed"
+    assert (leaf / "results" / "data.bin").read_bytes() == b"payload"
+    assert (local_trash / "results" / "data.bin").read_bytes() == b"payload"
+
+    recovered = recover_operation(project, interrupted.operation_id, True)
+
+    assert recovered.state == "committed"
+    assert not leaf.exists()
+    assert (local_trash / "results" / "data.bin").read_bytes() == b"payload"
+    assert copy_calls == 1
+
+
 @pytest.mark.parametrize("state", ["prepared", "hdd_trashed", "local_trashed"])
 def test_remove_recovers_after_each_boundary(
     project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
