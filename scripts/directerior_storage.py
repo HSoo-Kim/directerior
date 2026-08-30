@@ -234,6 +234,13 @@ def copy_tree_verified(
     raise DirecteriorError("copy verification failed; source preserved")
 
 
+def bytes_snapshot(content: bytes) -> TreeSnapshot:
+    digest = hashlib.sha256()
+    digest.update(str(len(content)).encode("ascii"))
+    digest.update(content)
+    return TreeSnapshot(file_count=1, byte_count=len(content), digest=digest.hexdigest())
+
+
 def file_snapshot(path: Path) -> TreeSnapshot:
     digest = hashlib.sha256()
     size = path.stat().st_size

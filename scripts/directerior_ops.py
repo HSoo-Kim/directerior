@@ -27,6 +27,7 @@ from directerior_history import (
 )
 from directerior_storage import (
     TreeSnapshot,
+    bytes_snapshot,
     copy_file_verified,
     copy_tree_verified,
     file_snapshot,
@@ -302,21 +303,17 @@ def continue_restore(record: OperationRecord) -> OperationRecord:
     return record
 
 
-def _manifest_matches(path: Path, hierarchy: list[str], names: list[str]) -> bool:
-    try:
-        raw = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    return raw.get("levels") == dict(zip(hierarchy, names, strict=True))
-
-def _update_manifest(path: Path, hierarchy: list[str], names: list[str]) -> None:
+def _updated_manifest_content(
+    path: Path, hierarchy: list[str] | tuple[str, ...], names: list[str] | tuple[str, ...]
+) -> bytes:
     manifest = path / "manifest.json"
     raw = json.loads(manifest.read_text(encoding="utf-8"))
     raw["levels"] = dict(zip(hierarchy, names, strict=True))
-    manifest.write_text(
-        json.dumps(raw, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    return (json.dumps(raw, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def _update_manifest(path: Path, hierarchy: list[str], names: list[str]) -> None:
+    (path / "manifest.json").write_bytes(_updated_manifest_content(path, hierarchy, names))
 
 
 def _matches_tree_no_follow_excluding(
@@ -355,6 +352,9 @@ def start_rename(
     manifest = old_leaf / "manifest.json"
     content_exclusions = (manifest, old_results) if offloaded else (manifest,)
     content_snapshot = tree_snapshot_no_follow(old_leaf, content_exclusions)
+    manifest_snapshot = bytes_snapshot(
+        _updated_manifest_content(old_leaf, config.hierarchy, new_names)
+    )
     hdd_snapshot = tree_snapshot(old_target) if offloaded else None
     record = _new_record(
         root,
@@ -372,6 +372,7 @@ def start_rename(
             "local_snapshot": asdict(local_snapshot),
             "unlinked_snapshot": asdict(unlinked_snapshot),
             "content_snapshot": asdict(content_snapshot),
+            "manifest_snapshot": asdict(manifest_snapshot),
             "hdd_snapshot": asdict(hdd_snapshot) if hdd_snapshot is not None else None,
             "offloaded": offloaded,
             "hierarchy": list(config.hierarchy),
@@ -389,16 +390,20 @@ def continue_rename(record: OperationRecord) -> OperationRecord:
     new_results = _path(record, "new_results")
     old_target = _path(record, "old_target")
     new_target = _path(record, "new_target")
-    if not all(
-        name in record.details
-        for name in ("local_snapshot", "unlinked_snapshot", "content_snapshot")
-    ):
+    required_snapshots = (
+        "local_snapshot",
+        "unlinked_snapshot",
+        "content_snapshot",
+        "manifest_snapshot",
+    )
+    if not all(name in record.details for name in required_snapshots):
         raise DirecteriorError(
             "rename journal lacks exact local snapshots; refusing unsafe recovery"
         )
     local_snapshot = _named_snapshot(record, "local_snapshot")
     unlinked_snapshot = _named_snapshot(record, "unlinked_snapshot")
     content_snapshot = _named_snapshot(record, "content_snapshot")
+    manifest_snapshot = _named_snapshot(record, "manifest_snapshot")
     offloaded = record.details.get("offloaded") is True
     hdd_snapshot = _named_snapshot(record, "hdd_snapshot") if offloaded else None
     hierarchy = _strings(record, "hierarchy")
@@ -492,7 +497,7 @@ def continue_rename(record: OperationRecord) -> OperationRecord:
                 offloaded and link_target(new_results) != new_target.resolve(strict=False)
             ):
                 raise _conflict(record, new_leaf, new_results, new_target)
-            if _manifest_matches(new_leaf, hierarchy, new_names):
+            if _matches_file(new_manifest, manifest_snapshot):
                 if not _matches_tree_no_follow_excluding(
                     new_leaf, content_snapshot, new_content_exclusions
                 ):
@@ -505,13 +510,15 @@ def continue_rename(record: OperationRecord) -> OperationRecord:
                 ):
                     raise _conflict(record, new_leaf)
                 _update_manifest(new_leaf, hierarchy, new_names)
+                if not _matches_file(new_manifest, manifest_snapshot):
+                    raise _conflict(record, new_manifest)
             record = _save(record, "manifest_updated")
         elif record.state == "manifest_updated":
             if (
                 not new_hdd_ready()
                 or offloaded
                 and link_target(new_results) != new_target.resolve(strict=False)
-                or not _manifest_matches(new_leaf, hierarchy, new_names)
+                or not _matches_file(new_manifest, manifest_snapshot)
                 or not _matches_tree_no_follow_excluding(
                     new_leaf, content_snapshot, new_content_exclusions
                 )

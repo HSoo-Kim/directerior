@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import directerior_ops
@@ -208,6 +209,37 @@ def test_rename_recovery_refuses_modified_hdd_tree(
         new_target.exists(),
     ) == positions
     assert changed.read_bytes() == b"changed"
+
+
+def test_rename_recovery_refuses_manifest_mutation_after_rewrite(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("DIRECTERIOR_STATE_HOME", str(tmp_path / "state"))
+    new = project / "methods" / "lora" / "experiments" / "exp02"
+    _fail_after_state(monkeypatch, "committed")
+
+    with pytest.raises(InjectedFailure):
+        rename_experiment(["lora", "exp01"], ["lora", "exp02"], True)
+
+    interrupted = _latest(project)
+    assert interrupted.state == "manifest_updated"
+    manifest = new / "manifest.json"
+    raw = json.loads(manifest.read_text(encoding="utf-8"))
+    raw["description"] = "changed after rename"
+    manifest.write_text(
+        json.dumps(raw, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DirecteriorError, match="recovery conflict"):
+        recover_operation(project, interrupted.operation_id, True)
+
+    assert _latest(project).state == "manifest_updated"
+    assert json.loads(manifest.read_text(encoding="utf-8"))["description"] == (
+        "changed after rename"
+    )
+
 
 
 @pytest.mark.parametrize(
