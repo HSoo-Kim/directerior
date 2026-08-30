@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import date
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from directerior_core import (
     DirecteriorError,
     Leaf,
     find_root,
+    hdd_results_path,
     iter_leaves,
     leaf_relative,
     load_config,
@@ -18,6 +20,7 @@ from directerior_core import (
     require_leaf,
     scaffold_plan,
     section_path,
+    validate_config,
     write_manifest,
 )
 from directerior_guards import (
@@ -26,8 +29,13 @@ from directerior_guards import (
     require_no_agent_assets,
     require_no_breaking_references,
 )
-from directerior_ops import PathMove, new_record, save_operation, structure_digest
-from directerior_storage import directory_size, is_offloaded
+from directerior_ops import start_adopt
+from directerior_storage import (
+    directory_size,
+    is_offloaded,
+    require_plain_tree,
+    tree_snapshot,
+)
 
 
 def initialize(
@@ -40,18 +48,19 @@ def initialize(
     config_path = root / CONFIG_NAME
     if config_path.exists():
         raise DirecteriorError(f"{config_path} already exists")
-    hierarchy = tuple(part.strip() for part in hierarchy_raw.split(",") if part.strip())
-    if not hierarchy:
-        raise DirecteriorError("--hierarchy needs at least one level name")
+    hierarchy = [part.strip() for part in hierarchy_raw.split(",")]
     source_files = require_new_project(root, allow_existing)
     raw = {
+        "schema": 2,
+        "project_id": uuid.uuid4().hex[:12],
         "hdd_root": hdd_root,
         "threshold_mb": threshold_mb,
-        "hierarchy": list(hierarchy),
+        "hierarchy": hierarchy,
         "sections": NUMBERED_SECTIONS,
     }
+    config = validate_config(raw, root)
     config_path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
-    (root / hierarchy[0]).mkdir(exist_ok=True)
+    (root / config.hierarchy[0]).mkdir(exist_ok=True)
     print(f"initialized {config_path}")
     print(json.dumps(raw, indent=2))
     if source_files:
@@ -59,6 +68,44 @@ def initialize(
             f"NOTE: {source_files} pre-existing source file(s) stay unmanaged. "
             "directerior moves directories but never rewrites imports or hardcoded paths."
         )
+
+
+def upgrade_config(approved: bool, allow_dirty: bool) -> None:
+    if not approved:
+        raise DirecteriorError(
+            "upgrade-config rewrites project identity; pass --yes only AFTER explicit approval"
+        )
+    root = find_root()
+    config = load_config(root)
+    if config.schema == 2:
+        raise DirecteriorError("config already uses schema 2")
+    if any(not value for value in config.sections.values()):
+        raise DirecteriorError("run migrate-layout --yes before upgrade-config")
+    if any(
+        is_offloaded(section_path(leaf, config, "results"))
+        for leaf in iter_leaves(root, config)
+    ):
+        raise DirecteriorError(
+            "upgrade-config refuses while results are offloaded; restore offloaded leaves first"
+        )
+    require_clean_worktree(root, "upgrade-config", allow_dirty)
+    raw = json.loads((root / CONFIG_NAME).read_text(encoding="utf-8"))
+    raw.update(
+        {
+            "schema": 2,
+            "project_id": uuid.uuid4().hex[:12],
+            "sections": config.sections,
+        }
+    )
+    validate_config(raw, root)
+    temporary = root / f"{CONFIG_NAME}.tmp"
+    try:
+        temporary.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(root / CONFIG_NAME)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    print(f"upgraded {root / CONFIG_NAME} to schema 2")
 
 
 def create_experiment(names_raw: list[str], description: str) -> None:
@@ -89,25 +136,40 @@ def scan_entries(root: Path, config: Config) -> list[dict[str, str | int | list[
     return entries
 
 
-def status_entries(root: Path, config: Config) -> list[dict[str, str | int | list[str]]]:
+def status_entries(
+    root: Path, config: Config, verify: bool = False
+) -> list[dict[str, object]]:
     threshold = config.threshold_mb * 1024 * 1024
-    entries: list[dict[str, str | int | list[str]]] = []
+    entries: list[dict[str, object]] = []
     for leaf in iter_leaves(root, config):
         results = section_path(leaf, config, "results")
-        if results.exists() and is_offloaded(results):
+        if is_offloaded(results):
             location = "hdd"
-            size = 0
+            local_size = 0
+            selected = hdd_results_path(config, root, leaf.names)
+            stored_size = directory_size(selected) if selected.is_dir() else 0
         else:
-            size = directory_size(results) if results.exists() else 0
-            location = "local_over_threshold" if size > threshold else "local"
-        entries.append(
-            {
-                "names": list(leaf.names),
-                "label": leaf.label,
-                "location": location,
-                "bytes": size,
-            }
-        )
+            selected = results
+            local_size = directory_size(results) if results.exists() else 0
+            stored_size = local_size
+            location = "local_over_threshold" if local_size > threshold else "local"
+        entry: dict[str, object] = {
+            "names": list(leaf.names),
+            "label": leaf.label,
+            "location": location,
+            "bytes": local_size,
+            "local_bytes": local_size,
+            "stored_bytes": stored_size,
+            "verified": None,
+        }
+        if verify:
+            if not selected.is_dir():
+                raise DirecteriorError(f"status --verify path is missing: {selected}")
+            require_plain_tree(selected, "status --verify")
+            snapshot = tree_snapshot(selected)
+            entry["verified"] = True
+            entry["digest"] = snapshot.digest
+        entries.append(entry)
     return entries
 
 
@@ -130,17 +192,17 @@ def adopt_output(
         raise DirecteriorError(f"source not found: {source}")
     if source == root or source in root.parents:
         raise DirecteriorError(f"refusing to adopt the project root or an ancestor: {source}")
-    require_no_agent_assets(source, "adopt")
     leaf = require_leaf(root, config, parse_names(config, names_raw))
     destination_root = section_path(leaf, config, section)
     if section == "results" and is_offloaded(destination_root):
         raise DirecteriorError(f"results section is offloaded; restore first: {destination_root}")
     if source == destination_root or destination_root in source.parents:
         raise DirecteriorError(f"already inside managed {section} section: {source}")
+    require_no_agent_assets(source, "adopt")
     if link_back and not source.is_dir():
         raise DirecteriorError("--link works for directories only")
     destination = destination_root / (destination_name or source.name)
-    if destination.exists():
+    if destination.exists() or is_offloaded(destination):
         raise DirecteriorError(f"destination already exists: {destination}")
     if not link_back:
         require_no_breaking_references(
@@ -150,34 +212,14 @@ def adopt_output(
             [config.hdd_root],
             allow_breaking_refs,
         )
-    head = require_clean_worktree(root, "adopt", allow_dirty)
-    digest = structure_digest(source)
-    is_dir = source.is_dir()
-    source.rename(destination)
-    if link_back:
-        from directerior_storage import make_link
-
-        make_link(source, destination)
-    record = new_record(
-        "adopt",
-        root,
-        head,
-        (
-            PathMove(
-                source=str(source),
-                destination=str(destination),
-                is_dir=is_dir,
-                digest=digest,
-                linked_back=link_back,
-            ),
-        ),
+    require_clean_worktree(root, "adopt", allow_dirty)
+    record = start_adopt(root, source, destination, link_back)
+    print(
+        f"adopted {source} -> {destination.relative_to(root)}; "
+        f"operation={record.operation_id}"
     )
-    save_operation(record)
-    print(f"adopted {source} -> {destination.relative_to(root)}")
     if link_back:
         print(f"  linked back: {source} -> {destination}")
-    print(f"  operation={record.operation_id}")
-    print(f"  undo with: expman.py undo {record.operation_id} --yes")
 
 
 def _alpha_label(index: int) -> str:

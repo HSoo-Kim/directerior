@@ -99,15 +99,15 @@ Directerior는 **처음부터 이 레이아웃 위에서 시작하는 프로젝�
 이미 성숙한 리포지토리가 있다면 코드는 그대로 두고 산출물만 관리하세요:
 
 ```bash
-python scripts/expman.py adopt ./outputs my-method exp01 --link --yes
-python scripts/expman.py offload my-method exp01 --yes
+directerior adopt ./outputs my-method exp01 --link --yes
+directerior offload my-method exp01 --yes
 ```
 
 ## 동작 방식
 
 ```
 project/                        # 루트 = .expman.json 위치
-├── .expman.json                # { "hdd_root": "D:/exp-archive", "threshold_mb": 100 }
+├── .expman.json                # schema 2 설정 + 충돌 방지 project_id
 └── methods/
     └── lora-finetune/          # 방법론 하나
         └── experiments/
@@ -122,7 +122,7 @@ project/                        # 루트 = .expman.json 위치
 
 ```
  SSD (빠름, 작음)                           HDD (큼, 여유)
- methods/.../exp01/results  ──junction──▶   exp-archive/project/methods/.../exp01/results
+ methods/.../exp01/3_results ──junction──▶ exp-archive/project--project_id/methods/.../exp01/3_results
         ▲
         └─ 코드는 이 경로를 그대로 읽고 씀 — 아무것도 깨지지 않음
 ```
@@ -133,14 +133,16 @@ Windows에서 junction은 **관리자 권한 불필요**, POSIX에서는 symlink
 
 ```bash
 cd my-project
-python scripts/expman.py init --hdd-root D:/exp-archive --threshold-mb 100
-python scripts/expman.py new lora-finetune exp01-baseline -d "baseline"
+uv sync
+directerior init --hdd-root D:/exp-archive --threshold-mb 100
+directerior new lora-finetune exp01-baseline -d "baseline"
 
-# ... 실험 실행, 산출물은 results/에 저장 ...
+# ... 실험 실행, 산출물은 3_results/에 저장 ...
 
-python scripts/expman.py scan                  # exit 2 = 오프로드 후보 존재
-python scripts/expman.py offload lora-finetune exp01-baseline --yes
-python scripts/expman.py status
+directerior scan                  # exit 2 = 오프로드 후보 존재
+directerior offload lora-finetune exp01-baseline --yes
+directerior status
+directerior status --verify       # 명시적 SHA-256 검증
 ```
 
 ## 사용자 정의 위계
@@ -149,15 +151,15 @@ python scripts/expman.py status
 원하는 위계를 정의하세요:
 
 ```bash
-python scripts/expman.py init --hdd-root D:/exp-archive --hierarchy datasets,methods,experiments
-# datasets/<데이터셋>/methods/<방법론>/experiments/<실험>/{code,results}
+directerior init --hdd-root D:/exp-archive --hierarchy datasets,methods,experiments
+# datasets/<데이터셋>/methods/<방법론>/experiments/<실험>/{1_plan,2_code,3_results}
 ```
 
 이후 모든 명령은 레벨당 이름 하나씩을 순서대로 받습니다:
 
 ```bash
-python scripts/expman.py new imagenet lora-finetune exp01-baseline
-python scripts/expman.py offload imagenet lora-finetune exp01-baseline --yes
+directerior new imagenet lora-finetune exp01-baseline
+directerior offload imagenet lora-finetune exp01-baseline --yes
 ```
 
 위계는 `.expman.json`에 저장됩니다. init 때 한 번 정하세요 — 데이터가 쌓인
@@ -176,12 +178,14 @@ python scripts/expman.py offload imagenet lora-finetune exp01-baseline --yes
 | `rename <기존...> --to <새이름...> --yes` | 로컬 leaf와 HDD 미러 동시 변경 |
 | `rm <이름...> --yes [--purge]` | 로컬 leaf와 HDD 복사본을 HDD 휴지통으로 이동; `--purge`는 영구 삭제 |
 | `adopt <path> <이름...> [--as NAME] [--link] [--allow-breaking-refs] --yes` | 제자리를 벗어난 산출물 편입; `--link`는 원래 경로 유지 |
-| `clean [--fix]` | HDD 빈 디렉토리 정리, 깨진 링크 복구, 고아·휴지통 보고 |
+| `clean [--fix]` | 정확한 HDD 대상이 있는 링크만 복구; 미해결 링크·고아·휴지통 보고(미해결 시 exit 2) |
 | `migrate-layout [--dry-run] --yes` | 변경 미리보기 또는 번호 구조 변환 |
-| `history [--json]` | 가역 작업 기록 표시(마이그레이션, `adopt`, `rm`) |
-| `undo [ID|latest] --yes` | 마이그레이션·`adopt`·`rm`을 엄격 검증 후 되돌림 |
+| `upgrade-config --yes [--allow-dirty]` | 모든 결과를 복원한 레거시 프로젝트를 schema 2와 고유 project ID로 명시적 업그레이드 |
+| `history [--json]` | 완료·중단된 마이그레이션과 경로 작업 원장 표시 |
+| `recover [ID|latest] --yes` | 파일시스템 상태를 검증하고 중단된 정방향 작업 재개 |
+| `undo [ID|latest] --yes` | committed 마이그레이션·`adopt`·비-purge `rm` 되돌림 |
 | `redo [ID|latest] --yes` | undo한 마이그레이션 재적용 |
-| `status [--json]` | 실험별 바이트와 local/HDD 위치 |
+| `status [--json] [--verify]` | 기본은 메타데이터 크기만; `--verify`는 SHA-256과 digest 추가 |
 
 데이터를 재배치하는 모든 명령은 `--allow-dirty`도 받습니다(아래 참고).
 
@@ -232,37 +236,25 @@ git 저장소 안에서는 **추적 중인** 파일이 수정된 상태이면 �
 병렬 분기가 생길 때만 `1_a_baseline`, `1_b_augmented`로 확장합니다.
 `add`가 다음 prefix를 자동 계산합니다.
 
-## 엄격한 가역 작업
+## 엄격한 가역 작업과 복구
 
-원장은 프로젝트 밖 사용자 상태 디렉토리에 저장되어, 복원된 프로젝트 안에는
-기록 파일이 남지 않습니다. `history` 하나에 두 종류가 함께 들어갑니다:
+Schema-3 원장은 프로젝트 밖 사용자 상태 디렉토리에 저장됩니다. `history`는
+완료된 작업과 중단된 작업을 함께 표시합니다.
 
-| 종류 | 명령 | 검증 | 되돌리기 |
-|---|---|---|---|
-| migration | `migrate-layout` | SHA-256 내용 전체 | `undo` + `redo` |
-| path operation | `adopt`, `rm` | 경로·크기 구조 | `undo` (재적용은 명령 재실행) |
+`offload`, `restore`, `rename`, `adopt`, `rm`, `migrate-layout`은 각 파일시스템
+전이를 기록합니다. 프로세스가 이동과 원장 기록 사이에서 중단되면
+`recover [ID|latest] --yes`가 현재 경로·snapshot·링크 대상을 검증한 뒤 이미
+승인된 정방향 작업만 재개합니다. 기록 상태 또는 정확히 다음 상태와 일치하지
+않으면 충돌로 중단하며 추측하거나 덮어쓰지 않습니다.
 
-`rm`은 실험과 HDD 사본을 삭제하는 대신
-`<hdd_root>/.trash/<프로젝트>/<작업-id>/`로 옮기고, `undo`가 오프로드 링크까지
-포함해 원래 자리로 되돌립니다. 데이터를 실제로 파괴하는 명령은 `--purge`뿐입니다.
+`undo`는 committed 기록만 받습니다. 마이그레이션은 `undo`/`redo`, `adopt`와
+비-purge `rm`은 `undo`를 지원합니다. `rm`은 데이터를
+`<hdd_root>/.trash/<project--project_id>/<작업-id>/`로 옮깁니다.
+`rm --purge`는 영구 삭제이며 진단 원장은 남지만 되돌릴 수 없습니다.
 
-undo 전후로
-`.expman.json` 원본 바이트, 모든 변경 파일의 경로·크기·SHA-256, 빈 디렉토리,
-HDD 위치와 junction 상태를 검증합니다. 하나라도 달라졌으면 이동 전에 거부합니다.
-성공한 undo는 기존 이름·파일 바이트·설정 포맷·HDD 경로·링크를 그대로 복구하고,
-외부 원장만 남겨 redo를 가능하게 합니다.
-
-schema v2 원장은 미래 version graph의 edge이기도 합니다:
-
-```text
-parent_id -> operation_id
-before_fingerprint -> after_fingerprint
-operation_type = migrate_layout
-```
-
-fingerprint는 명령 문자열이 아니라 프로젝트 상태를 나타내므로, 향후 rename,
-offload 같은 작업도 앞 작업의 결과와 다음 작업의 입력 상태가 같으면 같은 graph에
-연결할 수 있습니다. 기존 schema v1 원장도 로드 시 fingerprint를 계산해 호환합니다.
+레거시 설정은 그대로 읽고 `<hdd_root>/<프로젝트명>/` 경로를 유지합니다.
+`upgrade-config --yes`는 모든 오프로드 결과를 먼저 복원한 경우에만 schema-2
+project ID를 부여합니다.
 
 ## 팀에서 쓰기
 
@@ -274,16 +266,19 @@ set EXPMAN_HDD_ROOT=E:\my-archive      # Windows
 export EXPMAN_HDD_ROOT=/mnt/archive    # POSIX
 ```
 
-오프로드 데이터는 `<hdd_root>/<프로젝트명>/…` 아래에 저장되므로 아카이브
-드라이브 하나로 여러 프로젝트를 충돌 없이 관리할 수 있습니다.
+Schema-2 프로젝트는 `<hdd_root>/<프로젝트명>--<project_id>/…`를 사용하므로
+이름이 같은 프로젝트도 서로 다른 아카이브 경로를 가집니다.
 
 ## 안전 불변식
 
-- `offload`, `restore`, `rename`, `rm`, `adopt`, `migrate-layout`, `undo`,
-  `redo`는 **`--yes` 없이
-  무조건 실패** — 원본 삭제/재배치는 사용자 승인 필수
+- `offload`, `restore`, `rename`, `rm`, `adopt`, `migrate-layout`, `recover`,
+  `undo`, `redo`는 **`--yes` 없이 무조건 실패** — 원본 삭제·재배치·복구 재개는
+  사용자 승인 필수
 - offload/restore는 복사 → SHA-256 전체 트리 검증 → 원본 삭제 순서;
   공간 부족이면 복사 전에 중단
+- 일반 `scan`과 `status`는 메타데이터만 읽고, `status --verify`에서만 SHA-256 검증
+- `clean --fix`는 HDD 대상이 없으면 빈 디렉토리를 만들지 않으며, 미해결 링크와
+  고아가 남아 있으면 exit 2
 - **소스 코드는 절대 재작성하지 않음** — 깨질 참조는 보고·거부하고 판단은 사용자에게
 - **에이전트 지시 파일**(`AGENTS.md`, `CLAUDE.md`, `.claude/`, …)은 이동·삭제 대상에서 거부
 - 추적 파일이 수정된 git 워킹트리에서는 `--allow-dirty` 없이 재배치 불가

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Final
 
 CONFIG_NAME: Final = ".expman.json"
@@ -37,6 +38,8 @@ class Config:
     threshold_mb: int
     hierarchy: tuple[str, ...]
     sections: dict[str, str]
+    schema: int
+    project_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,21 +58,102 @@ def find_root(start: Path | None = None) -> Path:
         if (candidate / CONFIG_NAME).is_file():
             return candidate
     raise DirecteriorError(
-        f"no {CONFIG_NAME} found in {path} or parents; run 'expman.py init' first"
+        f"no {CONFIG_NAME} found in {path} or parents; run 'directerior init' first"
+    )
+
+
+def _validate_component(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise DirecteriorError(f"{field} must be a non-empty path component")
+    if (
+        value in (".", "..")
+        or "/" in value
+        or "\\" in value
+        or Path(value).is_absolute()
+        or bool(PureWindowsPath(value).drive)
+    ):
+        raise DirecteriorError(f"invalid {field} path component: {value!r}")
+    return value
+
+
+def validate_config(raw: object, root: Path) -> Config:
+    if not isinstance(raw, dict):
+        raise DirecteriorError(f"{CONFIG_NAME} must contain a JSON object")
+
+    schema_raw = raw.get("schema")
+    if schema_raw is None:
+        schema = 1
+        project_id = None
+    elif schema_raw == 2 and not isinstance(schema_raw, bool):
+        schema = 2
+        project_id_raw = raw.get("project_id")
+        if not isinstance(project_id_raw, str) or re.fullmatch(
+            r"[0-9a-f]{12}", project_id_raw
+        ) is None:
+            raise DirecteriorError("schema 2 requires a 12-character lowercase hex project_id")
+        project_id = project_id_raw
+    else:
+        raise DirecteriorError(f"unsupported config schema: {schema_raw!r}")
+
+    hdd_raw = os.environ.get("EXPMAN_HDD_ROOT", raw.get("hdd_root"))
+    if not isinstance(hdd_raw, str) or not hdd_raw.strip() or "\x00" in hdd_raw:
+        raise DirecteriorError("hdd_root must be a non-empty path string")
+    try:
+        hdd_root = Path(hdd_raw).expanduser()
+    except (OSError, ValueError) as exc:
+        raise DirecteriorError(f"invalid hdd_root: {hdd_raw!r}") from exc
+
+    if not hdd_root.is_absolute():
+        hdd_root = root / hdd_root
+    threshold = raw.get("threshold_mb")
+    if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold <= 0:
+        raise DirecteriorError("threshold_mb must be a positive integer")
+
+    hierarchy_raw = raw.get("hierarchy", list(DEFAULT_HIERARCHY))
+    if not isinstance(hierarchy_raw, list) or not hierarchy_raw:
+        raise DirecteriorError("hierarchy must be a non-empty list")
+    hierarchy = tuple(
+        _validate_component(value, f"hierarchy[{index}]")
+        for index, value in enumerate(hierarchy_raw)
+    )
+    if len(set(hierarchy)) != len(hierarchy):
+        raise DirecteriorError("hierarchy level names must be unique")
+
+    sections_raw = raw.get("sections")
+    if sections_raw is None:
+        if schema == 2:
+            raise DirecteriorError("schema 2 requires explicit plan, code, and results sections")
+        sections = dict(LEGACY_SECTIONS)
+    else:
+        if not isinstance(sections_raw, dict) or set(sections_raw) != {
+            "plan",
+            "code",
+            "results",
+        }:
+            raise DirecteriorError("sections must define exactly plan, code, and results")
+        sections = {
+            name: _validate_component(sections_raw[name], f"sections.{name}")
+            for name in ("plan", "code", "results")
+        }
+        if len(set(sections.values())) != len(sections):
+            raise DirecteriorError("section directory names must be unique")
+
+    return Config(
+        hdd_root=hdd_root,
+        threshold_mb=threshold,
+        hierarchy=hierarchy,
+        sections=sections,
+        schema=schema,
+        project_id=project_id,
     )
 
 
 def load_config(root: Path) -> Config:
-    raw = json.loads((root / CONFIG_NAME).read_text(encoding="utf-8"))
-    hierarchy = tuple(raw.get("hierarchy", DEFAULT_HIERARCHY))
-    override = os.environ.get("EXPMAN_HDD_ROOT")
-    hdd_root = Path(override if override is not None else raw["hdd_root"])
-    return Config(
-        hdd_root=hdd_root,
-        threshold_mb=int(raw["threshold_mb"]),
-        hierarchy=hierarchy,
-        sections=dict(raw.get("sections", LEGACY_SECTIONS)),
-    )
+    try:
+        raw = json.loads((root / CONFIG_NAME).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DirecteriorError(f"cannot read valid {CONFIG_NAME}: {exc}") from exc
+    return validate_config(raw, root)
 
 
 def parse_names(config: Config, names: list[str]) -> tuple[str, ...]:
@@ -78,9 +162,8 @@ def parse_names(config: Config, names: list[str]) -> tuple[str, ...]:
             f"hierarchy is {'/'.join(config.hierarchy)}: expected "
             f"{len(config.hierarchy)} name(s), got {len(names)}: {' '.join(names)}"
         )
-    for name in names:
-        if "/" in name or "\\" in name or name in (".", ".."):
-            raise DirecteriorError(f"invalid name: {name!r}")
+    for index, name in enumerate(names):
+        _validate_component(name, f"name[{index}]")
     return tuple(names)
 
 
@@ -98,13 +181,17 @@ def require_leaf(root: Path, config: Config, names: tuple[str, ...]) -> Leaf:
     return Leaf(names=names, path=path)
 
 
+def hdd_project_path(config: Config, root: Path) -> Path:
+    if config.schema == 2:
+        assert config.project_id is not None
+        return config.hdd_root / f"{root.name}--{config.project_id}"
+    return config.hdd_root / root.name
+
+
 def hdd_results_path(config: Config, root: Path, names: tuple[str, ...]) -> Path:
-    return (
-        config.hdd_root
-        / root.name
-        / leaf_relative(config, names)
-        / config.sections["results"]
-    )
+    return hdd_project_path(config, root) / leaf_relative(config, names) / config.sections[
+        "results"
+    ]
 
 
 def section_path(leaf: Leaf, config: Config, section: str) -> Path:

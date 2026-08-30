@@ -43,3 +43,28 @@ def test_status_json_reports_local_and_hdd_locations(project: Path) -> None:
     hdd_entry = json.loads(second_status.stdout)["entries"][0]
     assert local_entry["location"] == "local"
     assert hdd_entry["location"] == "hdd"
+    assert local_entry["local_bytes"] == local_entry["stored_bytes"] == 0
+    assert local_entry["verified"] is None
+    assert "digest" not in local_entry
+    assert hdd_entry["bytes"] == hdd_entry["local_bytes"] == 0
+    assert hdd_entry["stored_bytes"] == 0
+    assert hdd_entry["verified"] is None
+    assert "digest" not in hdd_entry
+
+
+def test_status_verify_reports_digest_without_changing_byte_meanings(project: Path) -> None:
+    results = project / "methods" / "lora" / "experiments" / "exp01" / "results"
+    (results / "artifact.bin").write_bytes(b"payload")
+    normal = json.loads(run_cli(project, "status", "--json").stdout)["entries"][0]
+
+    completed = run_cli(project, "status", "--json", "--verify")
+
+    assert completed.returncode == 0
+    verified = json.loads(completed.stdout)["entries"][0]
+    assert verified["label"] == normal["label"]
+    assert verified["location"] == normal["location"]
+    assert verified["bytes"] == normal["bytes"] == len(b"payload")
+    assert verified["local_bytes"] == normal["local_bytes"]
+    assert verified["stored_bytes"] == normal["stored_bytes"]
+    assert verified["verified"] is True
+    assert len(verified["digest"]) == 64

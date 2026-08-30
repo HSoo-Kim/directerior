@@ -3,7 +3,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import directerior_migrate
+import pytest
 from conftest import run_cli
+from directerior_history import MigrationRecord, load_record
+from directerior_lifecycle import offload
+from directerior_migrate import migrate_layout, redo_migration, undo_migration
+from directerior_ops import recover_operation
+from directerior_storage import link_target
 
 
 def state_env(tmp_path: Path) -> dict[str, str]:
@@ -46,7 +53,7 @@ def test_history_records_applied_migration(project: Path, tmp_path: Path) -> Non
     assert completed.returncode == 0
     entries = json.loads(completed.stdout)["entries"]
     assert len(entries) == 1
-    assert entries[0]["state"] == "applied"
+    assert entries[0]["state"] == "committed"
 
 
 def test_history_exposes_graph_metadata(project: Path, tmp_path: Path) -> None:
@@ -292,3 +299,72 @@ def test_offloaded_undo_redo_restores_hdd_paths(project: Path, tmp_path: Path) -
     assert not old_target.exists()
     assert (new_target / "artifact.bin").read_bytes() == b"payload"
     assert (leaf / "3_results" / "artifact.bin").read_bytes() == b"payload"
+
+
+def test_multileaf_migration_recovers_second_leaf_then_undoes_and_redoes(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("DIRECTERIOR_STATE_HOME", str(tmp_path / "state"))
+    second = project / "methods" / "lora" / "experiments" / "exp02"
+    (second / "code").mkdir(parents=True)
+    (second / "results").mkdir()
+    (second / "code" / "train.py").write_bytes(b"code-two")
+    (second / "results" / "artifact.bin").write_bytes(b"payload-two")
+    (second / "manifest.json").write_text(
+        json.dumps(
+            {
+                "levels": {"methods": "lora", "experiments": "exp02"},
+                "created": "2026-08-30",
+                "description": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+    offload(["lora", "exp02"], True)
+    before_config = (project / ".expman.json").read_bytes()
+    original_save = directerior_migrate.save_record
+    fired = False
+
+    def fail_before_second_results_checkpoint(record: MigrationRecord) -> None:
+        nonlocal fired
+        if (
+            not fired
+            and record.next_leaf_index == 1
+            and record.leaf_state == "results_renamed"
+        ):
+            fired = True
+            raise RuntimeError("injected migration interruption")
+        original_save(record)
+
+    monkeypatch.setattr(
+        directerior_migrate,
+        "save_record",
+        fail_before_second_results_checkpoint,
+    )
+
+    with pytest.raises(RuntimeError, match="injected migration interruption"):
+        migrate_layout(True)
+
+    interrupted = load_record(project, "latest")
+    assert interrupted.next_leaf_index == 1
+    assert interrupted.leaf_state == "code_renamed"
+    recovered = recover_operation(project, interrupted.operation_id, True)
+    assert isinstance(recovered, MigrationRecord)
+
+    assert recovered.state == "committed"
+    assert recovered.next_leaf_index == 2
+    after_config = (project / ".expman.json").read_bytes()
+    assert json.loads(after_config)["sections"]["results"] == "3_results"
+    new_target = Path(recovered.leaves[1].new_hdd_target)
+    assert link_target(second / "3_results") == new_target.resolve()
+    assert (second / "3_results" / "artifact.bin").read_bytes() == b"payload-two"
+
+    undo_migration(interrupted.operation_id, True)
+    assert (project / ".expman.json").read_bytes() == before_config
+    assert (second / "results" / "artifact.bin").read_bytes() == b"payload-two"
+
+    redo_migration(interrupted.operation_id, True)
+    assert (project / ".expman.json").read_bytes() == after_config
+    assert link_target(second / "3_results") == new_target.resolve()
+    assert (second / "3_results" / "artifact.bin").read_bytes() == b"payload-two"

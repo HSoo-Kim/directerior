@@ -1,7 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "directerior"
 version = "0.2.0"
 requires-python = ">=3.10"
+
+[project.scripts]
+directerior = "expman:main"
+
+[tool.setuptools]
+package-dir = {"" = "scripts"}
+py-modules = [
+    "directerior_core",
+    "directerior_guards",
+    "directerior_history",
+    "directerior_lifecycle",
+    "directerior_migrate",
+    "directerior_ops",
+    "directerior_project",
+    "directerior_storage",
+    "expman",
+]
 
 [dependency-groups]
 dev = [

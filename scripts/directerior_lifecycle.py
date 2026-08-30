@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sys
 from contextlib import suppress
 from pathlib import Path
 
 from directerior_core import (
+    Config,
     DirecteriorError,
-    Leaf,
     find_root,
+    hdd_project_path,
     hdd_results_path,
     iter_leaves,
     leaf_relative,
@@ -19,32 +19,25 @@ from directerior_core import (
     prune_empty_upward,
     require_leaf,
     section_path,
-    update_manifest_levels,
 )
 from directerior_guards import (
     require_approval,
     require_clean_worktree,
     require_no_agent_assets,
 )
-from directerior_history import new_operation_id
-from directerior_ops import (
-    PathMove,
-    iter_trash,
-    new_record,
-    save_operation,
-    structure_digest,
-    trash_root,
-)
+from directerior_ops import start_offload, start_remove, start_rename, start_restore
 from directerior_storage import (
-    copy_tree_verified,
     is_offloaded,
+    link_target,
     make_link,
     remove_link,
     same_volume,
 )
 
 
-def offload(names_raw: list[str], approved: bool, allow_dirty: bool = False) -> None:
+def offload(
+    names_raw: list[str], approved: bool, allow_dirty: bool = False
+) -> None:
     require_approval(approved, "offload")
     root = find_root()
     config = load_config(root)
@@ -56,32 +49,27 @@ def offload(names_raw: list[str], approved: bool, allow_dirty: bool = False) -> 
     target = hdd_results_path(config, root, names)
     if same_volume(results, target):
         print("WARNING: source and HDD target are on the same volume", file=sys.stderr)
-    snapshot = copy_tree_verified(results, target)
-    shutil.rmtree(results)
-    make_link(results, target)
-    print(f"offloaded {'/'.join(names)} ({snapshot.byte_count} bytes)")
+    record = start_offload(root, config, names, results, target)
+    print(f"offloaded {'/'.join(names)}; operation={record.operation_id}")
     print(f"  moved to: {target}")
 
 
-def restore(names_raw: list[str], approved: bool, allow_dirty: bool = False) -> None:
+def restore(
+    names_raw: list[str], approved: bool, allow_dirty: bool = False
+) -> None:
     require_approval(approved, "restore")
     root = find_root()
     config = load_config(root)
     require_clean_worktree(root, "restore", allow_dirty)
     names = parse_names(config, names_raw)
     results = section_path(require_leaf(root, config, names), config, "results")
+    source = hdd_results_path(config, root, names)
     if not is_offloaded(results):
         raise DirecteriorError(f"not offloaded: {results}")
-    source = hdd_results_path(config, root, names)
-    staging = results.with_name("results.restore")
-    if same_volume(source, staging):
+    if same_volume(source, results.parent):
         print("WARNING: source and restore target are on the same volume", file=sys.stderr)
-    copy_tree_verified(source, staging)
-    remove_link(results)
-    staging.rename(results)
-    shutil.rmtree(source)
-    prune_empty_upward(source.parent, config.hdd_root)
-    print(f"restored {'/'.join(names)} -> {results}")
+    record = start_restore(root, config, names, results, source)
+    print(f"restored {'/'.join(names)} -> {results}; operation={record.operation_id}")
 
 
 def rename_experiment(
@@ -98,25 +86,28 @@ def rename_experiment(
     new_names = parse_names(config, new_raw)
     old_leaf = require_leaf(root, config, old_names)
     new_path = root / leaf_relative(config, new_names)
-    if new_path.exists():
+    if new_path.exists() or is_offloaded(new_path):
         raise DirecteriorError(f"destination already exists: {new_path}")
     old_results = section_path(old_leaf, config, "results")
     old_target = hdd_results_path(config, root, old_names)
     new_target = hdd_results_path(config, root, new_names)
-    offloaded = is_offloaded(old_results)
-    if offloaded:
-        remove_link(old_results)
-    new_path.parent.mkdir(parents=True, exist_ok=True)
-    old_leaf.path.rename(new_path)
-    if offloaded:
-        new_target.parent.mkdir(parents=True, exist_ok=True)
-        old_target.rename(new_target)
-        make_link(section_path(Leaf(new_names, new_path), config, "results"), new_target)
-        prune_empty_upward(old_target.parent, config.hdd_root)
-    new_leaf = Leaf(names=new_names, path=new_path)
-    update_manifest_levels(new_leaf, config)
+    record = start_rename(
+        root,
+        config,
+        old_names,
+        new_names,
+        old_leaf.path,
+        new_path,
+        old_results,
+        old_target,
+        new_target,
+    )
+    prune_empty_upward(old_target.parent, hdd_project_path(config, root))
     prune_empty_upward(old_leaf.path.parent, root)
-    print(f"renamed {'/'.join(old_names)} -> {'/'.join(new_names)}")
+    print(
+        f"renamed {'/'.join(old_names)} -> {'/'.join(new_names)}; "
+        f"operation={record.operation_id}"
+    )
 
 
 def remove_experiment(
@@ -131,85 +122,104 @@ def remove_experiment(
     names = parse_names(config, names_raw)
     leaf = require_leaf(root, config, names)
     require_no_agent_assets(leaf.path, "rm")
-    results = section_path(leaf, config, "results")
+    require_clean_worktree(root, "rm", allow_dirty)
     target = hdd_results_path(config, root, names)
-    head = require_clean_worktree(root, "rm", allow_dirty)
-    offloaded = is_offloaded(results)
-    if offloaded:
-        remove_link(results)
-    if purge:
-        shutil.rmtree(leaf.path)
-        if target.is_dir():
-            shutil.rmtree(target)
-            prune_empty_upward(target.parent, config.hdd_root)
-        prune_empty_upward(leaf.path.parent, root)
-        print(f"purged {'/'.join(names)} - permanently deleted, no undo")
-        return
-    operation_id = new_operation_id()
-    trash = trash_root(config.hdd_root, root.name, operation_id)
-    trash.mkdir(parents=True)
-    moves: list[PathMove] = []
-    if target.is_dir():
-        hdd_trash = trash / "hdd"
-        moves.append(
-            PathMove(str(target), str(hdd_trash), True, structure_digest(target), False)
-        )
-        shutil.move(str(target), str(hdd_trash))
-        prune_empty_upward(target.parent, config.hdd_root)
-    local_trash = trash / "local"
-    moves.append(
-        PathMove(str(leaf.path), str(local_trash), True, structure_digest(leaf.path), False)
-    )
-    if same_volume(leaf.path, trash):
+    if not purge and same_volume(leaf.path, hdd_project_path(config, root)):
         print("WARNING: trash is on the same volume as the project", file=sys.stderr)
-    shutil.move(str(leaf.path), str(local_trash))
+    record = start_remove(root, config, names, leaf.path, target, purge)
     prune_empty_upward(leaf.path.parent, root)
-    record = new_record(
-        "rm",
-        root,
-        head,
-        tuple(moves),
-        (str(results), str(target)) if offloaded else None,
-        operation_id=operation_id,
-    )
-    save_operation(record)
-    print(f"removed {'/'.join(names)} -> trash: {trash}")
-    print(f"  operation={operation_id} (undo with: expman.py undo {operation_id} --yes)")
+    action = "purged permanently; no undo" if purge else "removed"
+    print(f"{action} {'/'.join(names)}; operation={record.operation_id}")
+
+
+def _hdd_result_paths(root: Path, config: Config):
+    hierarchy = config.hierarchy
+
+    def walk(base: Path, depth: int, names: tuple[str, ...]):
+        level = base / hierarchy[depth]
+        try:
+            entries = sorted(os.scandir(level), key=lambda entry: entry.name)
+        except OSError:
+            return
+        for entry in entries:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            child_names = (*names, entry.name)
+            if depth + 1 == len(hierarchy):
+                target = hdd_results_path(config, root, child_names)
+                if target.is_dir() and not is_offloaded(target):
+                    yield child_names, target
+            else:
+                yield from walk(Path(entry.path), depth + 1, child_names)
+
+    hdd_project = hdd_project_path(config, root)
+    if hdd_project.is_dir() and hierarchy:
+        yield from walk(hdd_project, 0, ())
 
 
 def clean(fix: bool) -> int:
     root = find_root()
     config = load_config(root)
-    hdd_project = config.hdd_root / root.name
-    issues = 0
+    hdd_project = hdd_project_path(config, root)
+    repaired = 0
+    unresolved = 0
+    managed_targets: set[Path] = set()
+
     for leaf in iter_leaves(root, config):
         results = section_path(leaf, config, "results")
-        if not is_offloaded(results):
-            continue
-        if hdd_results_path(config, root, leaf.names).is_dir():
-            continue
-        issues += 1
-        if fix:
-            remove_link(results)
-            results.mkdir()
-            print(f"fixed broken link: {leaf.label}")
-        else:
-            print(f"BROKEN LINK: {leaf.label} (use --fix)")
-    if hdd_project.is_dir():
-        pattern = "/".join(f"{level}/*" for level in config.hierarchy) + "/results"
-        for target in sorted(hdd_project.glob(pattern)):
-            relative = target.relative_to(hdd_project)
-            names = tuple(relative.parts[1::2])
-            local_leaf = Leaf(names, root / leaf_relative(config, names))
-            local = section_path(local_leaf, config, "results")
-            if is_offloaded(local):
+        expected = hdd_results_path(config, root, leaf.names)
+        managed_targets.add(expected.resolve(strict=False))
+        actual = link_target(results)
+
+        if expected.is_dir():
+            if actual == expected.resolve(strict=False):
                 continue
-            issues += 1
-            print(f"ORPHAN ON HDD: {target}")
+            if results.exists() and not is_offloaded(results):
+                unresolved += 1
+                print(f"CONFLICT: {leaf.label}; regular path blocks link repair: {results}")
+                continue
+            if not fix:
+                unresolved += 1
+                print(f"REPAIRABLE LINK: {leaf.label}; expected target: {expected}")
+                continue
+            if is_offloaded(results):
+                remove_link(results)
+            make_link(results, expected)
+            repaired += 1
+            print(f"repaired link: {leaf.label} -> {expected}")
+            continue
+
+        if is_offloaded(results):
+            unresolved += 1
+            print(f"BROKEN LINK: {leaf.label}; expected target missing: {expected}")
+
+    for _names, target in _hdd_result_paths(root, config):
+        if target.resolve(strict=False) in managed_targets:
+            continue
+        unresolved += 1
+        print(f"ORPHAN ON HDD: {target}")
+
+    if hdd_project.is_dir():
         for directory, _subdirs, _files in os.walk(hdd_project, topdown=False):
             with suppress(OSError):
                 Path(directory).rmdir()
-    for entry in iter_trash(config.hdd_root, root.name):
-        print(f"TRASH: {entry} (undo with: expman.py undo {entry.name} --yes)")
-    print(json.dumps({"issues": issues}) if fix else f"clean: {issues} issue(s)")
-    return 2 if issues and not fix else 0
+
+    trash_roots = (
+        config.hdd_root / ".trash" / hdd_project.name,
+        root / ".directerior-trash",
+    )
+    seen_trash: set[str] = set()
+    for trash_root in trash_roots:
+        if not trash_root.is_dir():
+            continue
+        for entry in sorted(path for path in trash_root.iterdir() if path.is_dir()):
+            if entry.name in seen_trash:
+                continue
+            seen_trash.add(entry.name)
+            print(f"TRASH: {entry} (undo with: directerior undo {entry.name} --yes)")
+
+    if fix:
+        print(json.dumps({"repaired": repaired, "unresolved": unresolved}))
+    else:
+        print(f"clean: {unresolved} unresolved issue(s)")
+    return 2 if unresolved else 0

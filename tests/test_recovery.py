@@ -1,0 +1,221 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import directerior_ops
+import pytest
+from directerior_core import DirecteriorError
+from directerior_history import OperationRecord, list_operation_records
+from directerior_lifecycle import offload, remove_experiment, rename_experiment, restore
+from directerior_ops import recover_operation
+from directerior_project import adopt_output
+
+
+class InjectedFailure(RuntimeError):
+    pass
+
+
+def _fail_after_state(monkeypatch: pytest.MonkeyPatch, state: str) -> None:
+    original = directerior_ops.save_operation_record
+    fired = False
+
+    def save_then_fail(record: OperationRecord) -> None:
+        nonlocal fired
+        if not fired and record.state == state and state != "prepared":
+            fired = True
+            raise InjectedFailure(state)
+        original(record)
+        if not fired and record.state == "prepared" and state == "prepared":
+            fired = True
+            raise InjectedFailure(state)
+
+    monkeypatch.setattr(directerior_ops, "save_operation_record", save_then_fail)
+
+
+def _latest(root: Path) -> OperationRecord:
+    return list_operation_records(root)[0]
+
+
+def _journal_state_after_crash(state: str, sequence: list[str]) -> str:
+    return state if state == "prepared" else sequence[sequence.index(state) - 1]
+
+@pytest.mark.parametrize("state", ["prepared", "copied", "verified", "source_removed", "linked"])
+def test_offload_recovers_after_each_boundary(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("DIRECTERIOR_STATE_HOME", str(tmp_path / "state"))
+    results = project / "methods" / "lora" / "experiments" / "exp01" / "results"
+    (results / "data.bin").write_bytes(b"payload")
+    _fail_after_state(monkeypatch, state)
+
+    with pytest.raises(InjectedFailure):
+        offload(["lora", "exp01"], True)
+
+    interrupted = _latest(project)
+    assert results.exists() or Path(str(interrupted.details["target"])).exists()
+    assert interrupted.state == _journal_state_after_crash(
+        state, ["prepared", "copied", "verified", "source_removed", "linked"]
+    )
+    recovered = recover_operation(project, interrupted.operation_id, True)
+
+    assert recovered.state == "committed"
+    assert (results / "data.bin").read_bytes() == b"payload"
+    assert _latest(project).state == "committed"
+
+
+@pytest.mark.parametrize(
+    "state", ["prepared", "copied", "verified", "link_removed", "local_installed", "hdd_removed"]
+)
+def test_restore_recovers_after_each_boundary(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("DIRECTERIOR_STATE_HOME", str(tmp_path / "state"))
+    results = project / "methods" / "lora" / "experiments" / "exp01" / "results"
+    (results / "data.bin").write_bytes(b"payload")
+    offload(["lora", "exp01"], True)
+    _fail_after_state(monkeypatch, state)
+
+    with pytest.raises(InjectedFailure):
+        restore(["lora", "exp01"], True)
+
+    interrupted = _latest(project)
+    assert interrupted.state == _journal_state_after_crash(
+        state,
+        [
+            "prepared",
+            "copied",
+            "verified",
+            "link_removed",
+            "local_installed",
+            "hdd_removed",
+        ],
+    )
+    recovered = recover_operation(project, interrupted.operation_id, True)
+
+    assert recovered.state == "committed"
+    assert not results.is_symlink()
+    assert (results / "data.bin").read_bytes() == b"payload"
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "prepared",
+        "link_removed",
+        "local_renamed",
+        "hdd_renamed",
+        "linked",
+        "manifest_updated",
+    ],
+)
+def test_rename_recovers_after_each_boundary(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("DIRECTERIOR_STATE_HOME", str(tmp_path / "state"))
+    old = project / "methods" / "lora" / "experiments" / "exp01"
+    (old / "results" / "data.bin").write_bytes(b"payload")
+    _fail_after_state(monkeypatch, state)
+
+    with pytest.raises(InjectedFailure):
+        rename_experiment(["lora", "exp01"], ["lora", "exp02"], True)
+
+    interrupted = _latest(project)
+    assert interrupted.state == _journal_state_after_crash(
+        state,
+        [
+            "prepared",
+            "link_removed",
+            "local_renamed",
+            "hdd_renamed",
+            "linked",
+            "manifest_updated",
+        ],
+    )
+    recovered = recover_operation(project, interrupted.operation_id, True)
+    new = project / "methods" / "lora" / "experiments" / "exp02"
+
+    assert recovered.state == "committed"
+    assert not old.exists()
+    assert (new / "results" / "data.bin").read_bytes() == b"payload"
+
+
+@pytest.mark.parametrize(
+    "state", ["prepared", "destination_ready", "verified", "source_removed", "linked"]
+)
+def test_cross_volume_adopt_recovers_after_each_boundary(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("DIRECTERIOR_STATE_HOME", str(tmp_path / "state"))
+    source = tmp_path / "outside"
+    source.mkdir()
+    (source / "data.bin").write_bytes(b"payload")
+    monkeypatch.setattr(directerior_ops, "same_volume", lambda *_args: False)
+    _fail_after_state(monkeypatch, state)
+
+    with pytest.raises(InjectedFailure):
+        adopt_output(str(source), ["lora", "exp01"], "adopted", True, True, "results")
+
+    interrupted = _latest(project)
+    recovered = recover_operation(project, interrupted.operation_id, True)
+    assert interrupted.state == _journal_state_after_crash(
+        state, ["prepared", "destination_ready", "verified", "source_removed", "linked"]
+    )
+    destination = project / "methods" / "lora" / "experiments" / "exp01" / "results" / "adopted"
+
+    assert recovered.state == "committed"
+    assert (destination / "data.bin").read_bytes() == b"payload"
+    assert (source / "data.bin").read_bytes() == b"payload"
+
+
+@pytest.mark.parametrize("state", ["prepared", "hdd_trashed", "local_trashed"])
+def test_remove_recovers_after_each_boundary(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("DIRECTERIOR_STATE_HOME", str(tmp_path / "state"))
+    leaf = project / "methods" / "lora" / "experiments" / "exp01"
+    (leaf / "results" / "data.bin").write_bytes(b"payload")
+    _fail_after_state(monkeypatch, state)
+
+    with pytest.raises(InjectedFailure):
+        remove_experiment(["lora", "exp01"], True)
+
+    interrupted = _latest(project)
+    local_trash = Path(str(interrupted.details["local_trash"]))
+    assert leaf.exists() or local_trash.exists()
+    recovered = recover_operation(project, interrupted.operation_id, True)
+    assert interrupted.state == _journal_state_after_crash(
+        state, ["prepared", "hdd_trashed", "local_trashed"]
+    )
+
+    assert recovered.state == "committed"
+    assert not leaf.exists()
+    assert (local_trash / "results" / "data.bin").read_bytes() == b"payload"
+
+
+def test_remove_recovery_refuses_modified_hdd_trash(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("DIRECTERIOR_STATE_HOME", str(tmp_path / "state"))
+    leaf = project / "methods" / "lora" / "experiments" / "exp01"
+    (leaf / "results" / "data.bin").write_bytes(b"payload")
+    offload(["lora", "exp01"], True)
+    _fail_after_state(monkeypatch, "hdd_trashed")
+
+    with pytest.raises(InjectedFailure):
+        remove_experiment(["lora", "exp01"], True)
+
+    interrupted = _latest(project)
+    hdd_trash = Path(str(interrupted.details["hdd_trash"]))
+    (hdd_trash / "data.bin").write_bytes(b"changed")
+
+    with pytest.raises(DirecteriorError, match="recovery conflict"):
+        recover_operation(project, interrupted.operation_id, True)
+
+    assert leaf.is_dir()
+    assert hdd_trash.is_dir()

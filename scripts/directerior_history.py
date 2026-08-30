@@ -13,8 +13,6 @@ from typing import Literal
 from directerior_core import DirecteriorError
 from directerior_storage import TreeSnapshot
 
-MIGRATION_KIND = "migration"
-
 
 @dataclass(frozen=True, slots=True)
 class LeafMigration:
@@ -43,6 +41,19 @@ class MigrationRecord:
     parent_id: str | None = None
     before_fingerprint: str = ""
     after_fingerprint: str = ""
+    git_head: str | None = None
+    next_leaf_index: int = 0
+    leaf_state: str = "prepared"
+
+@dataclass(frozen=True, slots=True)
+class OperationRecord:
+    operation_id: str
+    operation_type: str
+    project_root: str
+    created_at: str
+    git_head: str | None
+    state: str
+    details: dict[str, object]
 
 
 def state_home() -> Path:
@@ -117,7 +128,7 @@ def compute_fingerprint(
 
 def find_parent_id(records: list[MigrationRecord], before_fingerprint: str) -> str | None:
     for record in records:
-        if record.state == "applied" and record.after_fingerprint == before_fingerprint:
+        if record.state == "committed" and record.after_fingerprint == before_fingerprint:
             return record.operation_id
     return None
 
@@ -126,8 +137,7 @@ def save_record(record: MigrationRecord) -> None:
     directory = project_history_dir(Path(record.project_root))
     directory.mkdir(parents=True, exist_ok=True)
     payload = {
-        "schema": 2,
-        "kind": MIGRATION_KIND,
+        "schema": 3,
         "id": record.operation_id,
         "state": record.state,
         "project_root": record.project_root,
@@ -138,12 +148,69 @@ def save_record(record: MigrationRecord) -> None:
         "parent_id": record.parent_id,
         "before_fingerprint": record.before_fingerprint,
         "after_fingerprint": record.after_fingerprint,
+        "git_head": record.git_head,
+        "next_leaf_index": record.next_leaf_index,
+        "leaf_state": record.leaf_state,
         "leaves": [asdict(leaf) for leaf in record.leaves],
     }
     target = directory / f"{record.operation_id}.json"
     staging = target.with_suffix(".json.tmp")
     staging.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     staging.replace(target)
+
+def save_operation_record(record: OperationRecord) -> None:
+    directory = project_history_dir(Path(record.project_root))
+    directory.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": 3,
+        "id": record.operation_id,
+        "operation_type": record.operation_type,
+        "project_root": record.project_root,
+        "created_at": record.created_at,
+        "git_head": record.git_head,
+        "state": record.state,
+        "details": record.details,
+    }
+    target = directory / f"{record.operation_id}.json"
+    staging = target.with_suffix(".json.tmp")
+    staging.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    staging.replace(target)
+
+
+def list_operation_records(root: Path) -> list[OperationRecord]:
+    directory = project_history_dir(root)
+    if not directory.is_dir():
+        return []
+    records: list[OperationRecord] = []
+    for path in sorted(directory.glob("*.json"), reverse=True):
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if raw.get("schema") != 3 or "details" not in raw:
+            continue
+        records.append(
+            OperationRecord(
+                operation_id=str(raw["id"]),
+                operation_type=str(raw["operation_type"]),
+                project_root=str(raw["project_root"]),
+                created_at=str(raw["created_at"]),
+                git_head=str(raw["git_head"]) if raw.get("git_head") is not None else None,
+                state=str(raw["state"]),
+                details=dict(raw["details"]),
+            )
+        )
+    return records
+
+
+def load_operation_record(root: Path, operation_id: str) -> OperationRecord:
+    records = list_operation_records(root)
+    if operation_id == "latest":
+        for record in records:
+            if record.state != "committed":
+                return record
+        raise DirecteriorError("no interrupted operation to recover")
+    for record in records:
+        if record.operation_id == operation_id:
+            return record
+    raise DirecteriorError(f"operation history not found: {operation_id}")
 
 
 def load_record(root: Path, operation_id: str) -> MigrationRecord:
@@ -158,18 +225,6 @@ def load_record(root: Path, operation_id: str) -> MigrationRecord:
     raise DirecteriorError(f"migration history not found: {operation_id}")
 
 
-def record_kind(root: Path, operation_id: str) -> str:
-    """Which journal owns an id: migrations or path operations."""
-    directory = project_history_dir(root)
-    entries = sorted(directory.glob("*.json"), reverse=True) if directory.is_dir() else []
-    for path in entries:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        kind = str(raw.get("kind", MIGRATION_KIND))
-        if operation_id == "latest" or raw["id"] == operation_id:
-            return kind
-    raise DirecteriorError(f"no history entry for: {operation_id}")
-
-
 def list_records(root: Path) -> list[MigrationRecord]:
     directory = project_history_dir(root)
     if not directory.is_dir():
@@ -177,7 +232,7 @@ def list_records(root: Path) -> list[MigrationRecord]:
     records: list[MigrationRecord] = []
     for path in sorted(directory.glob("*.json"), reverse=True):
         raw = json.loads(path.read_text(encoding="utf-8"))
-        if raw.get("kind", MIGRATION_KIND) != MIGRATION_KIND:
+        if raw.get("schema") == 3 and "details" in raw:
             continue
         leaves = tuple(
             LeafMigration(
@@ -200,7 +255,7 @@ def list_records(root: Path) -> list[MigrationRecord]:
         )
         record = MigrationRecord(
             operation_id=raw["id"],
-            state=raw["state"],
+            state="committed" if raw["state"] == "applied" else raw["state"],
             project_root=raw["project_root"],
             created_at=raw["created_at"],
             before_config=base64.b64decode(raw["before_config_b64"]),
@@ -210,6 +265,11 @@ def list_records(root: Path) -> list[MigrationRecord]:
             parent_id=raw.get("parent_id"),
             before_fingerprint=raw.get("before_fingerprint", ""),
             after_fingerprint=raw.get("after_fingerprint", ""),
+            git_head=(
+                str(raw["git_head"]) if raw.get("git_head") is not None else None
+            ),
+            next_leaf_index=int(raw.get("next_leaf_index", 0)),
+            leaf_state=str(raw.get("leaf_state", "prepared")),
         )
         if not record.before_fingerprint:
             record = replace_record_fingerprints(record)
@@ -228,12 +288,9 @@ def replace_record_fingerprints(record: MigrationRecord) -> MigrationRecord:
 
 
 def show_history(root: Path, as_json: bool) -> None:
-    from directerior_ops import list_operations
-
-    entries = [
+    migration_entries = [
         {
             "id": record.operation_id,
-            "kind": MIGRATION_KIND,
             "state": record.state,
             "created_at": record.created_at,
             "operation_type": record.operation_type,
@@ -243,30 +300,30 @@ def show_history(root: Path, as_json: bool) -> None:
         }
         for record in list_records(root)
     ]
-    entries.extend(
+    operation_entries = [
         {
             "id": record.operation_id,
-            "kind": "path_op",
             "state": record.state,
             "created_at": record.created_at,
             "operation_type": record.operation_type,
-            "git_head": record.git_head,
-            "paths": [move.source for move in record.moves],
+            "parent_id": None,
+            "before_fingerprint": "",
+            "after_fingerprint": "",
         }
-        for record in list_operations(root)
+        for record in list_operation_records(root)
+    ]
+    entries = sorted(
+        [*migration_entries, *operation_entries],
+        key=lambda entry: str(entry["created_at"]),
+        reverse=True,
     )
-    entries.sort(key=lambda entry: str(entry["id"]), reverse=True)
     if as_json:
         print(json.dumps({"entries": entries}))
         return
     for entry in entries:
-        if entry["kind"] == MIGRATION_KIND:
-            parent = entry["parent_id"] or "ROOT"
-            print(
-                f"{parent} -> {entry['id']}  {entry['operation_type']}  "
-                f"{entry['state']}  {str(entry['before_fingerprint'])[:8]}"
-                f"->{str(entry['after_fingerprint'])[:8]}"
-            )
-        else:
-            paths = ", ".join(str(path) for path in entry["paths"])  # pyright: ignore[reportGeneralTypeIssues]
-            print(f"{entry['id']}  {entry['operation_type']}  {entry['state']}  {paths}")
+        parent = entry["parent_id"] or "ROOT"
+        print(
+            f"{parent} -> {entry['id']}  {entry['operation_type']}  "
+            f"{entry['state']}  {str(entry['before_fingerprint'])[:8]}"
+            f"->{str(entry['after_fingerprint'])[:8]}"
+        )

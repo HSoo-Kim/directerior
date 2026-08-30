@@ -41,16 +41,16 @@ For an existing codebase, recommend the narrow, safe subset instead:
 3. If they still want a full layout, that is a manual migration they own; you
    may help with it, but not through directerior, and not silently.
 
-All commands run through `scripts/expman.py` (resolve relative to this skill
-directory): `python <skill-dir>/scripts/expman.py <command>`.
-Run from anywhere inside the project; the script finds the project root by
-locating `.expman.json` upward.
+Use the installed `directerior <command>` entry point. When operating directly
+from a checked-out skill repository, the supported fallback is
+`python <skill-dir>/scripts/expman.py <command>`. Run from anywhere inside the
+project; the CLI finds `.expman.json` upward.
 
 ## Managed layout
 
 ```
 project/                      # root = where .expman.json lives
-├── .expman.json              # { "hdd_root": "D:/exp-archive", "threshold_mb": 100 }
+├── .expman.json              # schema 2 config + collision-resistant project_id
 └── methods/
     └── <method>/             # one methodology, e.g. "lora-finetune"
         └── experiments/
@@ -61,7 +61,8 @@ project/                      # root = where .expman.json lives
                 └── manifest.json # method, experiment, created, description
 ```
 
-Offloaded copies mirror the same tree under `<hdd_root>/<project-name>/`.
+Schema-2 projects mirror under `<hdd_root>/<project-name>--<project_id>/`.
+Legacy configs remain readable and retain `<hdd_root>/<project-name>/`.
 
 The two levels above are the default. `.expman.json` may define any hierarchy
 (e.g. `"hierarchy": ["datasets", "methods", "experiments"]`); every command
@@ -95,15 +96,17 @@ Rules for the agent:
 | `rm <name...> --yes` | move local leaf + HDD copy to the HDD trash (undoable) |
 | `rm <name...> --yes --purge` | delete permanently instead; no undo |
 | `adopt <path> <name...> [--as NAME] [--link] [--section plan\|code\|results] [--allow-breaking-refs] --yes` | move an out-of-place output into the leaf |
-| `clean [--fix]` | prune empty HDD dirs; report broken links (`--fix` repairs) and orphans; exit 2 if issues |
+| `clean [--fix]` | repair only links whose exact HDD target exists; report unresolved links, orphans, and trash; exit 2 while unresolved |
 | `migrate-layout --yes` | convert all legacy `code/results` leaves to numbered sections |
 | `migrate-layout --dry-run` | preview every migration path without mutation/history |
-| `history [--json]` | list external reversible journals (migrations + `adopt`/`rm`) |
-| `undo [ID|latest] --yes` | verify and reverse a migration, an `adopt`, or an `rm` |
+| `upgrade-config --yes [--allow-dirty]` | assign a schema-2 project ID after all offloaded results are restored |
+| `history [--json]` | list completed and interrupted external journals |
+| `recover [ID|latest] --yes` | verify and resume an interrupted forward operation |
+| `undo [ID|latest] --yes` | verify and reverse a committed migration, `adopt`, or non-purge `rm` |
 | `redo [ID|latest] --yes` | verify and reapply an undone migration |
+| `status [--json] [--verify]` | metadata-only sizes by default; `--verify` adds SHA-256 digest |
 
 Every data-relocating command also takes `--allow-dirty`; see the git section.
-| `status [--json]` | every experiment with size and local/HDD location |
 
 ## Workflow
 
@@ -122,8 +125,8 @@ Every data-relocating command also takes `--allow-dirty`; see the git section.
 5. **When the user wants data back on fast storage**: report that restore
    deletes the verified HDD source after copying, ASK for approval, then
    `restore <name...> --yes`.
-6. **Periodically or when links look stale**: `clean`, then `clean --fix`
-   after reporting findings to the user.
+6. **Periodically or when links look stale**: run `clean`. Run `clean --fix`
+   only after reporting findings; missing targets and regular paths stay unresolved.
 
 ## Project setup - which projects qualify
 
@@ -164,36 +167,29 @@ anyway; the operation journal covers those.
 Commit or stash first. `--allow-dirty` exists for the rare case where the user
 knowingly accepts that their uncommitted edits and this move are entangled.
 
-## Strict undo/redo protocol
+## Strict undo/recovery protocol
 
-Journals live outside the project in Directerior's user state directory, so a
-restored project carries no bookkeeping files. Two kinds share one `history`:
+Schema-3 journals live outside the project in Directerior's user state
+directory. `history` shows both completed and interrupted operations.
 
-- **migration** (`migrate-layout`): full content verification, `undo` + `redo`.
-- **path operation** (`adopt`, `rm`): structure verification, `undo` only -
-  reapply by re-running the command. `rm` moves data to
-  `<hdd_root>/.trash/<project>/<operation-id>/` instead of deleting it, and
-  `undo` moves it back, link and all.
+`offload`, `restore`, `rename`, `adopt`, `rm`, and `migrate-layout` journal
+every filesystem transition. After interruption:
 
-Before `undo` or `redo`:
+1. Run `history` and identify the requested record (default `latest`).
+2. Explain that `recover` verifies exact snapshots, paths, and link targets,
+   and resumes the already-approved forward operation only.
+3. ASK for fresh approval, then run `recover [ID|latest] --yes`.
+4. If state does not match the journal or its exact immediate successor, do
+   not bypass the conflict or move files manually.
 
-1. Run `history` and identify the requested operation (default `latest`).
-2. Explain that Directerior will verify exact config bytes, file paths,
-   SHA-256 contents, empty directories, HDD targets, and link state.
-3. ASK for explicit approval. Never pass `--yes` based on prior approval for
-   migration; undo and redo each require their own current approval.
-4. Run the command. If verification reports any post-operation change, do
-   not bypass it or move files manually. Show the conflict and ask whether
-   the user wants to keep current state or manually reconcile.
+`undo` accepts only committed records and requires its own fresh approval.
+Migrations support `undo` and `redo`; `adopt` and non-purge `rm` support
+`undo`. Trash lives under
+`<hdd_root>/.trash/<project--project_id>/<operation-id>/`. `rm --purge`
+permanently deletes data, records a diagnostic journal, and cannot be undone.
 
-Successful undo must leave no journal inside the project. The external
-journal remains solely so redo is possible.
-
-Schema-v2 history entries are graph edges with `operation_type`, `parent_id`,
-`before_fingerprint`, and `after_fingerprint`. State fingerprints are
-command-independent. When future operations produce a state matching the
-next operation's input fingerprint, link them through `parent_id`. Preserve
-schema-v1 readability by deriving missing fingerprints at load time.
+Legacy configs are not rewritten implicitly. `upgrade-config --yes` is the
+explicit path to schema 2 and refuses until all offloaded leaves are restored.
 
 ## Adaptive numbering
 
@@ -244,10 +240,10 @@ restoring offloaded results first, moving dirs, then re-offloading).
 
 ## Safety invariants
 
-- `offload`, `restore`, `rename`, `rm`, `adopt`, `migrate-layout`, `undo`,
-  and `redo` without `--yes` always
-  fail. Every operation that deletes source data or relocates user data
-  requires explicit approval in the current conversation.
+- `offload`, `restore`, `rename`, `rm`, `adopt`, `migrate-layout`, `recover`,
+  `undo`, and `redo` without `--yes` always fail. Every operation that deletes,
+  relocates, or resumes user data requires explicit approval in the current
+  conversation.
 - Agent instruction files are never moved, deleted, or rewritten.
 - Source code is never rewritten; broken references are reported, not repaired.
 - A dirty tracked git worktree blocks relocation unless `--allow-dirty`.
@@ -259,5 +255,8 @@ restoring offloaded results first, moving dirs, then re-offloading).
 - Offload refuses when the HDD target already exists; adopt refuses to
   overwrite an existing destination (no silent overwrite).
 - `restore` and `clean --fix` remove only links and empty directories, never
-  data. Orphaned HDD copies are reported, never auto-deleted.
+  data. A missing HDD target is not replaced with an empty directory; unresolved
+  links and orphaned HDD copies are reported with exit 2.
+- Ordinary `scan` and `status` read metadata only. Use `status --verify` for
+  explicit SHA-256 verification and digest output.
 - Offloaded dirs count as 0 local bytes in `scan`/`status` and show as `HDD`.

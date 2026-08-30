@@ -64,7 +64,7 @@ def test_rm_moves_the_experiment_to_trash_instead_of_deleting_it(tmp_path: Path)
     # Then
     assert completed.returncode == 0
     assert not leaf.exists()
-    trashed = hdd / ".trash" / root.name
+    trashed = hdd / ".trash"
     recovered = next(trashed.rglob("artifact.bin"))
     assert recovered.read_bytes() == b"payload"
 
@@ -83,7 +83,7 @@ def test_undo_restores_a_removed_experiment(tmp_path: Path) -> None:
     assert completed.returncode == 0
     assert (leaf / "3_results" / "artifact.bin").read_bytes() == b"payload"
     assert (leaf / "manifest.json").is_file()
-    assert not any((hdd / ".trash" / root.name).iterdir())
+    assert not (hdd / ".trash").exists() or not any((hdd / ".trash").rglob("*"))
 
 
 def test_undo_restores_an_offloaded_experiment_with_its_link(tmp_path: Path) -> None:
@@ -104,7 +104,7 @@ def test_undo_restores_an_offloaded_experiment_with_its_link(tmp_path: Path) -> 
     assert json.loads(status.stdout)["entries"][0]["location"] == "hdd"
 
 
-def test_purge_deletes_permanently_without_a_journal(tmp_path: Path) -> None:
+def test_purge_deletes_permanently_with_a_diagnostic_journal(tmp_path: Path) -> None:
     # Given
     root, hdd, env = new_project(tmp_path)
     leaf = root / "methods" / "lora" / "experiments" / "exp01"
@@ -118,7 +118,12 @@ def test_purge_deletes_permanently_without_a_journal(tmp_path: Path) -> None:
     assert "no undo" in completed.stdout
     assert not leaf.exists()
     assert not (hdd / ".trash").exists()
-    assert json.loads(run_cli(root, "history", "--json", env=env).stdout)["entries"] == []
+    entry = latest_operation(root, env)
+    assert entry["operation_type"] == "rm"
+    assert entry["state"] == "committed"
+    undo = run_cli(root, "undo", "latest", "--yes", env=env)
+    assert undo.returncode == 1
+    assert "cannot be undone" in undo.stderr
 
 
 def test_undo_refuses_when_the_moved_data_changed(tmp_path: Path) -> None:
@@ -152,7 +157,7 @@ def test_history_lists_path_operations(tmp_path: Path) -> None:
     # Then
     entry = latest_operation(root, env)
     assert entry["operation_type"] == "adopt"
-    assert entry["state"] == "applied"
+    assert entry["state"] == "committed"
 
 
 def test_undo_requires_its_own_approval(tmp_path: Path) -> None:

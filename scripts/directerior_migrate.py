@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 from directerior_core import (
     CONFIG_NAME,
     NUMBERED_SECTIONS,
+    PLAN_TEMPLATES,
     Config,
     DirecteriorError,
     Leaf,
@@ -33,8 +35,10 @@ from directerior_history import (
 from directerior_storage import (
     TreeSnapshot,
     is_offloaded,
+    link_target,
     make_link,
     remove_link,
+    require_plain_tree,
     tree_snapshot,
 )
 
@@ -44,6 +48,19 @@ EMPTY_SNAPSHOT = TreeSnapshot(
     digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
 )
 
+
+def _git_head(root: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except OSError:
+        return None
+    return completed.stdout.strip() if completed.returncode == 0 else None
 
 def _numbered_config_bytes(before: bytes) -> bytes:
     raw = json.loads(before.decode("utf-8"))
@@ -74,6 +91,13 @@ def _build_record(root: Path, config: Config, leaves: list[Leaf]) -> MigrationRe
         new_target = hdd_results_path(new_config, root, leaf.names) if offloaded else Path()
         code_existed = code.is_dir()
         results_existed = results.is_dir() or offloaded
+        if code_existed:
+            require_plain_tree(code, "migrate-layout")
+        if results_existed:
+            require_plain_tree(
+                old_target if offloaded else results,
+                "migrate-layout",
+            )
         records.append(
             LeafMigration(
                 names=leaf.names,
@@ -102,6 +126,7 @@ def _build_record(root: Path, config: Config, leaves: list[Leaf]) -> MigrationRe
         before_config=before,
         after_config=_numbered_config_bytes(before),
         leaves=tuple(records),
+        git_head=_git_head(root),
     )
     before_fingerprint = compute_fingerprint(record, "before")
     return replace(
@@ -127,35 +152,164 @@ def _matches(path: Path, expected: TreeSnapshot) -> bool:
     return path.is_dir() and tree_snapshot(path) == expected
 
 
-def _apply(root: Path, record: MigrationRecord) -> MigrationRecord:
-    updated: list[LeafMigration] = []
-    for leaf in record.leaves:
-        old_code, old_results, plan, new_code, new_results, _base = _paths(root, leaf)
-        scaffold_plan(plan)
-        if leaf.code_existed:
-            old_code.rename(new_code)
-        else:
-            new_code.mkdir()
-        if leaf.offloaded:
-            old_target = Path(leaf.old_hdd_target)
-            new_target = Path(leaf.new_hdd_target)
-            remove_link(old_results)
-            new_target.parent.mkdir(parents=True, exist_ok=True)
-            old_target.rename(new_target)
-            make_link(new_results, new_target)
-        elif leaf.results_existed:
-            old_results.rename(new_results)
-        else:
-            new_results.mkdir()
-        updated.append(replace(leaf, plan_snapshot=tree_snapshot(plan)))
-    (root / CONFIG_NAME).write_bytes(record.after_config)
-    applied_without_fingerprint = replace(record, state="applied", leaves=tuple(updated))
-    applied = replace(
-        applied_without_fingerprint,
-        after_fingerprint=compute_fingerprint(applied_without_fingerprint, "after"),
+def _plan_complete(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    entries = list(path.iterdir())
+    if {entry.name for entry in entries} != set(PLAN_TEMPLATES):
+        return False
+    return all(
+        entry.is_file()
+        and entry.read_text(encoding="utf-8") == PLAN_TEMPLATES[entry.name]
+        for entry in entries
     )
-    _verify_applied(root, applied)
-    return applied
+
+
+def _replace_leaf(
+    record: MigrationRecord, index: int, leaf: LeafMigration
+) -> MigrationRecord:
+    leaves = list(record.leaves)
+    leaves[index] = leaf
+    return replace(record, leaves=tuple(leaves))
+
+
+def _save_progress(record: MigrationRecord, **changes: object) -> MigrationRecord:
+    updated = replace(record, **changes)
+    save_record(updated)
+    return updated
+
+
+def _migration_conflict(
+    record: MigrationRecord, leaf: LeafMigration | None, *paths: Path
+) -> DirecteriorError:
+    label = "/".join(leaf.names) if leaf is not None else "config"
+    return DirecteriorError(
+        f"migration recovery conflict at {label} ({record.leaf_state}): "
+        + ", ".join(str(path) for path in paths)
+    )
+
+
+def continue_migration(root: Path, record: MigrationRecord) -> MigrationRecord:
+    if record.state != "prepared":
+        raise DirecteriorError(f"cannot recover migration in state: {record.state}")
+    while record.next_leaf_index < len(record.leaves):
+        index = record.next_leaf_index
+        leaf = record.leaves[index]
+        old_code, old_results, plan, new_code, new_results, _base = _paths(root, leaf)
+
+        if record.leaf_state == "prepared":
+            if not plan.exists():
+                scaffold_plan(plan)
+            if not _plan_complete(plan):
+                raise _migration_conflict(record, leaf, plan)
+            leaf = replace(leaf, plan_snapshot=tree_snapshot(plan))
+            record = _replace_leaf(record, index, leaf)
+            record = _save_progress(record, leaf_state="plan_created")
+        elif record.leaf_state == "plan_created":
+            before_ready = (
+                leaf.code_existed
+                and _matches(old_code, leaf.code_snapshot)
+                and not new_code.exists()
+                or not leaf.code_existed
+                and not old_code.exists()
+                and not new_code.exists()
+            )
+            after_ready = (
+                not old_code.exists() and _matches(new_code, leaf.code_snapshot)
+            )
+            if before_ready:
+                old_code.rename(new_code) if leaf.code_existed else new_code.mkdir()
+            elif not after_ready:
+                raise _migration_conflict(record, leaf, old_code, new_code)
+            record = _save_progress(record, leaf_state="code_renamed")
+        elif record.leaf_state == "code_renamed":
+            if leaf.offloaded:
+                old_target = Path(leaf.old_hdd_target)
+                new_target = Path(leaf.new_hdd_target)
+                if link_target(old_results) == old_target.resolve(strict=False):
+                    remove_link(old_results)
+                elif not (not old_results.exists() and not is_offloaded(old_results)):
+                    raise _migration_conflict(record, leaf, old_results)
+                if _matches(old_target, leaf.results_snapshot) and not new_target.exists():
+                    new_target.parent.mkdir(parents=True, exist_ok=True)
+                    old_target.rename(new_target)
+                elif not (
+                    not old_target.exists()
+                    and _matches(new_target, leaf.results_snapshot)
+                ):
+                    raise _migration_conflict(record, leaf, old_target, new_target)
+            else:
+                before_ready = (
+                    leaf.results_existed
+                    and _matches(old_results, leaf.results_snapshot)
+                    and not new_results.exists()
+                    or not leaf.results_existed
+                    and not old_results.exists()
+                    and not new_results.exists()
+                )
+                after_ready = (
+                    not old_results.exists()
+                    and _matches(new_results, leaf.results_snapshot)
+                )
+                if before_ready:
+                    (
+                        old_results.rename(new_results)
+                        if leaf.results_existed
+                        else new_results.mkdir()
+                    )
+                elif not after_ready:
+                    raise _migration_conflict(record, leaf, old_results, new_results)
+            record = _save_progress(record, leaf_state="results_renamed")
+        elif record.leaf_state == "results_renamed":
+            if leaf.offloaded:
+                new_target = Path(leaf.new_hdd_target)
+                if not _matches(new_target, leaf.results_snapshot):
+                    raise _migration_conflict(record, leaf, new_target)
+                if not new_results.exists() and not is_offloaded(new_results):
+                    make_link(new_results, new_target)
+                elif link_target(new_results) != new_target.resolve(strict=False):
+                    raise _migration_conflict(record, leaf, new_results, new_target)
+            record = _save_progress(record, leaf_state="linked")
+        elif record.leaf_state == "linked":
+            if leaf.plan_snapshot is None or not _matches(plan, leaf.plan_snapshot):
+                raise _migration_conflict(record, leaf, plan)
+            if not _matches(new_code, leaf.code_snapshot):
+                raise _migration_conflict(record, leaf, new_code)
+            result_data = Path(leaf.new_hdd_target) if leaf.offloaded else new_results
+            if not _matches(result_data, leaf.results_snapshot):
+                raise _migration_conflict(record, leaf, result_data)
+            if leaf.offloaded and link_target(new_results) != result_data.resolve(
+                strict=False
+            ):
+                raise _migration_conflict(record, leaf, new_results)
+            record = _save_progress(
+                record,
+                next_leaf_index=index + 1,
+                leaf_state="prepared",
+            )
+        else:
+            raise _migration_conflict(record, leaf)
+
+    config_path = root / CONFIG_NAME
+    if record.leaf_state == "prepared":
+        current = config_path.read_bytes()
+        if current == record.before_config:
+            staging = config_path.with_name(f"{CONFIG_NAME}.{record.operation_id}.tmp")
+            staging.write_bytes(record.after_config)
+            staging.replace(config_path)
+        elif current != record.after_config:
+            raise _migration_conflict(record, None, config_path)
+        record = _save_progress(record, leaf_state="config_replaced")
+    if record.leaf_state != "config_replaced":
+        raise _migration_conflict(record, None, config_path)
+    committed = replace(
+        record,
+        state="committed",
+        after_fingerprint=compute_fingerprint(record, "after"),
+    )
+    _verify_applied(root, committed)
+    save_record(committed)
+    return committed
 
 
 def _verify_applied(root: Path, record: MigrationRecord) -> None:
@@ -219,16 +373,16 @@ def migrate_layout(approved: bool, dry_run: bool = False, allow_dirty: bool = Fa
     require_clean_worktree(root, "migrate-layout", allow_dirty)
     record = _build_record(root, config, leaves)
     save_record(record)
-    applied = _apply(root, record)
-    save_record(applied)
-    print(f"migrated {root}; operation={applied.operation_id}")
+    committed = continue_migration(root, record)
+    print(f"migrated {root}; operation={committed.operation_id}")
+    print(f"  undo: directerior undo {committed.operation_id} --yes")
 
 
 def undo_migration(operation_id: str, approved: bool) -> None:
     require_approval(approved, "undo")
     root = find_root()
     record = load_record(root, operation_id)
-    if record.state != "applied":
+    if record.state != "committed":
         raise DirecteriorError(f"cannot undo migration in state: {record.state}")
     _verify_applied(root, record)
     for leaf in reversed(record.leaves):
@@ -263,6 +417,14 @@ def redo_migration(operation_id: str, approved: bool) -> None:
     if record.state != "undone":
         raise DirecteriorError(f"cannot redo migration in state: {record.state}")
     _verify_undone(root, record)
-    applied = _apply(root, replace(record, state="prepared"))
-    save_record(applied)
-    print(f"redone migration {record.operation_id}")
+    committed = continue_migration(
+        root,
+        replace(
+            record,
+            state="prepared",
+            next_leaf_index=0,
+            leaf_state="prepared",
+            after_fingerprint="",
+        ),
+    )
+    print(f"redone migration {committed.operation_id}")

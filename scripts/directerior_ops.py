@@ -1,205 +1,795 @@
-"""Reversible journal for path operations (`adopt`, `rm`).
-
-Migrations have their own journal in `directerior_history`. These records cover
-the two commands that used to be one-way doors: `adopt` moved data with no way
-back, and `rm` deleted it outright.
-"""
-
 from __future__ import annotations
 
-import hashlib
 import json
-import os
 import shutil
+import subprocess
 from contextlib import suppress
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-from directerior_core import DirecteriorError
+from directerior_core import (
+    Config,
+    DirecteriorError,
+    Leaf,
+    hdd_project_path,
+    prune_empty_upward,
+    section_path,
+)
 from directerior_guards import require_approval
-from directerior_history import new_operation_id, project_history_dir
-from directerior_storage import make_link, remove_link
-
-KIND = "path_op"
-TRASH_DIR = ".trash"
-
-
-@dataclass(frozen=True, slots=True)
-class PathMove:
-    source: str
-    destination: str
-    is_dir: bool
-    digest: str
-    linked_back: bool
-
-
-@dataclass(frozen=True, slots=True)
-class OperationRecord:
-    operation_id: str
-    state: str
-    operation_type: str
-    project_root: str
-    created_at: str
-    git_head: str | None
-    moves: tuple[PathMove, ...]
-    relink: tuple[str, str] | None = None
+from directerior_history import (
+    MigrationRecord,
+    OperationRecord,
+    list_operation_records,
+    list_records,
+    new_operation_id,
+    save_operation_record,
+)
+from directerior_storage import (
+    TreeSnapshot,
+    copy_file_verified,
+    copy_tree_verified,
+    file_snapshot,
+    is_offloaded,
+    link_target,
+    make_link,
+    remove_link,
+    require_capacity,
+    require_disjoint_paths,
+    require_plain_tree,
+    same_volume,
+    tree_snapshot,
+    tree_snapshot_no_follow,
+)
 
 
-def structure_digest(path: Path) -> str:
-    """Fingerprint names and sizes only.
-
-    A journalled move never rewrites bytes, so structure is what undo must
-    verify. Content hashing stays in `directerior_storage`, where transfers
-    actually copy data. `lstat` keeps dangling symlinks from raising.
-    """
-    digest = hashlib.sha256()
-    if not path.is_dir() or path.is_symlink():
-        digest.update(b"F\0" + path.name.encode("utf-8") + str(path.lstat().st_size).encode())
-        return digest.hexdigest()
-    for directory, subdirs, filenames in os.walk(path):
-        subdirs.sort()
-        base = Path(directory)
-        for subdir in subdirs:
-            relative = (base / subdir).relative_to(path).as_posix()
-            digest.update(b"D\0" + relative.encode("utf-8"))
-        for filename in sorted(filenames):
-            entry = base / filename
-            relative = entry.relative_to(path).as_posix()
-            digest.update(b"F\0" + relative.encode("utf-8") + str(entry.lstat().st_size).encode())
-    return digest.hexdigest()
+def _git_head(root: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except OSError:
+        return None
+    return completed.stdout.strip() if completed.returncode == 0 else None
 
 
-def new_record(
-    operation_type: str,
-    root: Path,
-    git_head: str | None,
-    moves: tuple[PathMove, ...],
-    relink: tuple[str, str] | None = None,
-    operation_id: str | None = None,
+def _new_record(
+    root: Path, operation_type: str, details: dict[str, object], operation_id: str | None = None
 ) -> OperationRecord:
     return OperationRecord(
         operation_id=operation_id or new_operation_id(),
-        state="applied",
         operation_type=operation_type,
         project_root=str(root),
         created_at=datetime.now(timezone.utc).isoformat(),
-        git_head=git_head,
-        moves=moves,
-        relink=relink,
+        git_head=_git_head(root),
+        state="prepared",
+        details=details,
     )
 
 
-def save_operation(record: OperationRecord) -> None:
-    directory = project_history_dir(Path(record.project_root))
-    directory.mkdir(parents=True, exist_ok=True)
-    payload = {"schema": 2, "kind": KIND, "id": record.operation_id, **asdict(record)}
-    target = directory / f"{record.operation_id}.json"
-    staging = target.with_suffix(".json.tmp")
-    staging.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    staging.replace(target)
+def _save(record: OperationRecord, state: str) -> OperationRecord:
+    updated = replace(record, state=state)
+    save_operation_record(updated)
+    return updated
 
 
-def _from_payload(raw: dict[str, object]) -> OperationRecord:
-    moves = tuple(
-        PathMove(
-            source=str(move["source"]),
-            destination=str(move["destination"]),
-            is_dir=bool(move["is_dir"]),
-            digest=str(move["digest"]),
-            linked_back=bool(move["linked_back"]),
+def _path(record: OperationRecord, name: str) -> Path:
+    value = record.details.get(name)
+    if not isinstance(value, str):
+        raise DirecteriorError(f"invalid {record.operation_type} journal path: {name}")
+    return Path(value)
+
+def _strings(record: OperationRecord, name: str) -> list[str]:
+    value = record.details.get(name)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise DirecteriorError(f"invalid {record.operation_type} journal list: {name}")
+    return value
+
+
+def _named_snapshot(record: OperationRecord, name: str) -> TreeSnapshot:
+    value = record.details.get(name)
+    if not isinstance(value, dict):
+        raise DirecteriorError(f"invalid {record.operation_type} journal snapshot: {name}")
+    try:
+        return TreeSnapshot(
+            file_count=int(value["file_count"]),
+            byte_count=int(value["byte_count"]),
+            digest=str(value["digest"]),
         )
-        for move in raw["moves"]  # pyright: ignore[reportGeneralTypeIssues]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DirecteriorError(
+            f"invalid {record.operation_type} journal snapshot: {name}"
+        ) from exc
+
+
+def _snapshot(record: OperationRecord) -> TreeSnapshot:
+    return _named_snapshot(record, "snapshot")
+
+
+def _matches_tree(path: Path, snapshot: TreeSnapshot) -> bool:
+    try:
+        return path.is_dir() and not is_offloaded(path) and tree_snapshot(path) == snapshot
+    except (OSError, DirecteriorError):
+        return False
+
+def _matches_tree_no_follow(path: Path, snapshot: TreeSnapshot) -> bool:
+    try:
+        return (
+            path.is_dir()
+            and not is_offloaded(path)
+            and tree_snapshot_no_follow(path) == snapshot
+        )
+    except OSError:
+        return False
+
+
+def _matches_file(path: Path, snapshot: TreeSnapshot) -> bool:
+    try:
+        return path.is_file() and not is_offloaded(path) and file_snapshot(path) == snapshot
+    except OSError:
+        return False
+
+
+def _matches_data(path: Path, snapshot: TreeSnapshot, is_directory: bool) -> bool:
+    return _matches_tree(path, snapshot) if is_directory else _matches_file(path, snapshot)
+
+
+def _absent(path: Path) -> bool:
+    return not path.exists() and not is_offloaded(path)
+
+
+def _conflict(record: OperationRecord, *paths: Path) -> DirecteriorError:
+    joined = ", ".join(str(path) for path in paths)
+    return DirecteriorError(
+        f"recovery conflict for {record.operation_type} {record.operation_id} "
+        f"in state {record.state}: {joined}"
     )
-    relink_raw = raw.get("relink")
-    relink = (
-        (str(relink_raw[0]), str(relink_raw[1]))  # pyright: ignore[reportIndexIssue]
-        if relink_raw is not None
-        else None
+
+
+def start_offload(
+    root: Path,
+    _config: Config,
+    names: tuple[str, ...],
+    results: Path,
+    target: Path,
+) -> OperationRecord:
+    require_plain_tree(results, "offload")
+    require_disjoint_paths(results, target, "offload")
+    if target.exists() or is_offloaded(target):
+        raise DirecteriorError(f"target already exists: {target}")
+    snapshot = require_capacity(results, target)
+    record = _new_record(
+        root,
+        "offload",
+        {
+            "names": list(names),
+            "source": str(results),
+            "target": str(target),
+            "snapshot": asdict(snapshot),
+            "link_intent": True,
+            "transfer_mode": "copy",
+        },
     )
-    return OperationRecord(
-        operation_id=str(raw["operation_id"]),
-        state=str(raw["state"]),
-        operation_type=str(raw["operation_type"]),
-        project_root=str(raw["project_root"]),
-        created_at=str(raw["created_at"]),
-        git_head=None if raw.get("git_head") is None else str(raw["git_head"]),
-        moves=moves,
-        relink=relink,
+    save_operation_record(record)
+    return continue_offload(record)
+
+
+def continue_offload(record: OperationRecord) -> OperationRecord:
+    source = _path(record, "source")
+    target = _path(record, "target")
+    snapshot = _snapshot(record)
+    while record.state != "committed":
+        if record.state == "prepared":
+            if _matches_tree(source, snapshot) and _absent(target):
+                copy_tree_verified(source, target, "offload")
+            elif not (_matches_tree(source, snapshot) and _matches_tree(target, snapshot)):
+                raise _conflict(record, source, target)
+            record = _save(record, "copied")
+        elif record.state == "copied":
+            if not (_matches_tree(source, snapshot) and _matches_tree(target, snapshot)):
+                raise _conflict(record, source, target)
+            record = _save(record, "verified")
+        elif record.state == "verified":
+            if _matches_tree(source, snapshot) and _matches_tree(target, snapshot):
+                shutil.rmtree(source)
+            elif not (_absent(source) and _matches_tree(target, snapshot)):
+                raise _conflict(record, source, target)
+            record = _save(record, "source_removed")
+        elif record.state == "source_removed":
+            if _absent(source) and _matches_tree(target, snapshot):
+                make_link(source, target)
+            elif not (
+                link_target(source) == target.resolve(strict=False)
+                and _matches_tree(target, snapshot)
+            ):
+                raise _conflict(record, source, target)
+            record = _save(record, "linked")
+        elif record.state == "linked":
+            if link_target(source) != target.resolve(strict=False) or not _matches_tree(
+                target, snapshot
+            ):
+                raise _conflict(record, source, target)
+            record = _save(record, "committed")
+        else:
+            raise _conflict(record, source, target)
+    return record
+
+
+def start_restore(
+    root: Path,
+    config: Config,
+    names: tuple[str, ...],
+    link: Path,
+    source: Path,
+) -> OperationRecord:
+    if link_target(link) != source.resolve(strict=False) or not source.is_dir():
+        raise DirecteriorError(f"not offloaded to expected target: {link}")
+    require_plain_tree(source, "restore")
+    operation_id = new_operation_id()
+    staging = link.with_name(f".{link.name}.restore-{operation_id}")
+    require_disjoint_paths(source, staging, "restore")
+    snapshot = require_capacity(source, staging)
+    record = _new_record(
+        root,
+        "restore",
+        {
+            "names": list(names),
+            "link": str(link),
+            "source": str(source),
+            "staging": str(staging),
+            "snapshot": asdict(snapshot),
+            "link_intent": False,
+            "transfer_mode": "copy",
+            "hdd_root": str(config.hdd_root),
+        },
+        operation_id,
+    )
+    save_operation_record(record)
+    return continue_restore(record)
+
+
+def continue_restore(record: OperationRecord) -> OperationRecord:
+    link = _path(record, "link")
+    source = _path(record, "source")
+    staging = _path(record, "staging")
+    snapshot = _snapshot(record)
+    while record.state != "committed":
+        if record.state == "prepared":
+            expected_link = link_target(link) == source.resolve(strict=False)
+            if expected_link and _matches_tree(source, snapshot) and _absent(staging):
+                copy_tree_verified(source, staging, "restore")
+            elif not (
+                expected_link
+                and _matches_tree(source, snapshot)
+                and _matches_tree(staging, snapshot)
+            ):
+                raise _conflict(record, link, source, staging)
+            record = _save(record, "copied")
+        elif record.state == "copied":
+            if not (_matches_tree(source, snapshot) and _matches_tree(staging, snapshot)):
+                raise _conflict(record, source, staging)
+            record = _save(record, "verified")
+        elif record.state == "verified":
+            if link_target(link) == source.resolve(strict=False):
+                remove_link(link)
+            elif not _absent(link):
+                raise _conflict(record, link)
+            record = _save(record, "link_removed")
+        elif record.state == "link_removed":
+            if _absent(link) and _matches_tree(staging, snapshot):
+                staging.rename(link)
+            elif not (_matches_tree(link, snapshot) and _absent(staging)):
+                raise _conflict(record, link, staging)
+            record = _save(record, "local_installed")
+        elif record.state == "local_installed":
+            if _matches_tree(link, snapshot) and _matches_tree(source, snapshot):
+                shutil.rmtree(source)
+            elif not (_matches_tree(link, snapshot) and _absent(source)):
+                raise _conflict(record, link, source)
+            record = _save(record, "hdd_removed")
+        elif record.state == "hdd_removed":
+            if not (_matches_tree(link, snapshot) and _absent(source)):
+                raise _conflict(record, link, source)
+            hdd_root = _path(record, "hdd_root")
+            prune_empty_upward(source.parent, hdd_root)
+            record = _save(record, "committed")
+        else:
+            raise _conflict(record, link, source, staging)
+    return record
+
+
+def _manifest_matches(path: Path, hierarchy: list[str], names: list[str]) -> bool:
+    try:
+        raw = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return raw.get("levels") == dict(zip(hierarchy, names, strict=True))
+
+def _update_manifest(path: Path, hierarchy: list[str], names: list[str]) -> None:
+    manifest = path / "manifest.json"
+    raw = json.loads(manifest.read_text(encoding="utf-8"))
+    raw["levels"] = dict(zip(hierarchy, names, strict=True))
+    manifest.write_text(
+        json.dumps(raw, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
     )
 
 
-def list_operations(root: Path) -> list[OperationRecord]:
-    directory = project_history_dir(root)
-    if not directory.is_dir():
-        return []
-    records: list[OperationRecord] = []
-    for path in sorted(directory.glob("*.json"), reverse=True):
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if raw.get("kind") == KIND:
-            records.append(_from_payload(raw))
-    return records
+def start_rename(
+    root: Path,
+    config: Config,
+    old_names: tuple[str, ...],
+    new_names: tuple[str, ...],
+    old_leaf: Path,
+    new_leaf: Path,
+    old_results: Path,
+    old_target: Path,
+    new_target: Path,
+) -> OperationRecord:
+    offloaded = is_offloaded(old_results)
+    if offloaded:
+        require_plain_tree(old_target, "rename")
+    else:
+        require_plain_tree(old_leaf, "rename")
+    snapshot = tree_snapshot(old_target if offloaded else old_leaf)
+    record = _new_record(
+        root,
+        "rename",
+        {
+            "old_names": list(old_names),
+            "new_names": list(new_names),
+            "old_leaf": str(old_leaf),
+            "new_leaf": str(new_leaf),
+            "old_results": str(old_results),
+            "new_results": str(new_leaf / config.sections["results"]),
+            "old_target": str(old_target),
+            "new_target": str(new_target),
+            "snapshot": asdict(snapshot),
+            "offloaded": offloaded,
+            "hierarchy": list(config.hierarchy),
+            "hdd_root": str(config.hdd_root),
+        },
+    )
+    save_operation_record(record)
+    return continue_rename(record)
 
 
-def load_operation(root: Path, operation_id: str) -> OperationRecord:
-    records = list_operations(root)
-    if not records:
-        raise DirecteriorError("no path-operation history for this project")
-    if operation_id == "latest":
-        return records[0]
-    for record in records:
-        if record.operation_id == operation_id:
-            return record
-    raise DirecteriorError(f"operation not found: {operation_id}")
+def continue_rename(record: OperationRecord) -> OperationRecord:
+    old_leaf = _path(record, "old_leaf")
+    new_leaf = _path(record, "new_leaf")
+    old_results = _path(record, "old_results")
+    new_results = _path(record, "new_results")
+    old_target = _path(record, "old_target")
+    new_target = _path(record, "new_target")
+    snapshot = _snapshot(record)
+    offloaded = record.details.get("offloaded") is True
+    hierarchy = _strings(record, "hierarchy")
+    new_names = _strings(record, "new_names")
+    while record.state != "committed":
+        if record.state == "prepared":
+            if offloaded:
+                if link_target(old_results) == old_target.resolve(strict=False):
+                    remove_link(old_results)
+                elif not (_absent(old_results) and old_leaf.is_dir()):
+                    raise _conflict(record, old_results, old_target)
+            record = _save(record, "link_removed")
+        elif record.state == "link_removed":
+            if old_leaf.is_dir() and _absent(new_leaf):
+                new_leaf.parent.mkdir(parents=True, exist_ok=True)
+                old_leaf.rename(new_leaf)
+            elif not (new_leaf.is_dir() and _absent(old_leaf)):
+                raise _conflict(record, old_leaf, new_leaf)
+            record = _save(record, "local_renamed")
+        elif record.state == "local_renamed":
+            if offloaded:
+                if _matches_tree(old_target, snapshot) and _absent(new_target):
+                    new_target.parent.mkdir(parents=True, exist_ok=True)
+                    old_target.rename(new_target)
+                elif not (_matches_tree(new_target, snapshot) and _absent(old_target)):
+                    raise _conflict(record, old_target, new_target)
+            record = _save(record, "hdd_renamed")
+        elif record.state == "hdd_renamed":
+            if offloaded:
+                if _absent(new_results) and _matches_tree(new_target, snapshot):
+                    make_link(new_results, new_target)
+                elif link_target(new_results) != new_target.resolve(strict=False):
+                    raise _conflict(record, new_results, new_target)
+            record = _save(record, "linked")
+        elif record.state == "linked":
+            if not new_leaf.is_dir() or (
+                offloaded and link_target(new_results) != new_target.resolve(strict=False)
+            ):
+                raise _conflict(record, new_leaf, new_results)
+            if not _manifest_matches(new_leaf, hierarchy, new_names):
+                _update_manifest(new_leaf, hierarchy, new_names)
+            record = _save(record, "manifest_updated")
+        elif record.state == "manifest_updated":
+            if not _manifest_matches(new_leaf, hierarchy, new_names):
+                raise _conflict(record, new_leaf / "manifest.json")
+            record = _save(record, "committed")
+        else:
+            raise _conflict(record, old_leaf, new_leaf)
+    return record
 
 
-def _verify(record: OperationRecord, expect_at: str) -> None:
-    for move in record.moves:
-        present = Path(move.destination if expect_at == "destination" else move.source)
-        restored = Path(move.source if expect_at == "destination" else move.destination)
-        if not present.exists():
-            raise DirecteriorError(f"missing since {record.operation_type}: {present}")
-        if structure_digest(present) != move.digest:
-            raise DirecteriorError(f"changed since {record.operation_type}: {present}")
-        if restored.exists() and not (expect_at == "destination" and move.linked_back):
-            raise DirecteriorError(f"restore target already exists: {restored}")
+def start_adopt(
+    root: Path,
+    source: Path,
+    destination: Path,
+    link_back: bool,
+) -> OperationRecord:
+    if destination.exists() or is_offloaded(destination):
+        raise DirecteriorError(f"destination already exists: {destination}")
+    require_disjoint_paths(source, destination, "adopt")
+    is_directory = source.is_dir()
+    if is_directory:
+        require_plain_tree(source, "adopt")
+        snapshot = tree_snapshot(source)
+    else:
+        snapshot = file_snapshot(source)
+    mode = "rename" if same_volume(source, destination) else "copy"
+    record = _new_record(
+        root,
+        "adopt",
+        {
+            "source": str(source),
+            "destination": str(destination),
+            "snapshot": asdict(snapshot),
+            "is_directory": is_directory,
+            "link_intent": link_back,
+            "transfer_mode": mode,
+        },
+    )
+    save_operation_record(record)
+    return continue_adopt(record)
 
 
-def undo_operation(root: Path, operation_id: str, approved: bool) -> None:
+def continue_adopt(record: OperationRecord) -> OperationRecord:
+    source = _path(record, "source")
+    destination = _path(record, "destination")
+    snapshot = _snapshot(record)
+    is_directory = record.details.get("is_directory") is True
+    link_back = record.details.get("link_intent") is True
+    mode = record.details.get("transfer_mode")
+    while record.state != "committed":
+        if record.state == "prepared":
+            source_matches = _matches_data(source, snapshot, is_directory)
+            destination_matches = _matches_data(destination, snapshot, is_directory)
+            if source_matches and _absent(destination):
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if mode == "rename":
+                    source.rename(destination)
+                elif is_directory:
+                    copy_tree_verified(source, destination, "adopt")
+                else:
+                    copy_file_verified(source, destination, "adopt")
+            elif not (
+                destination_matches
+                and (
+                    mode == "rename"
+                    and _absent(source)
+                    or mode == "copy"
+                    and source_matches
+                )
+            ):
+                raise _conflict(record, source, destination)
+            record = _save(record, "destination_ready")
+        elif record.state == "destination_ready":
+            if not _matches_data(destination, snapshot, is_directory):
+                raise _conflict(record, destination)
+            if mode == "copy" and not _matches_data(source, snapshot, is_directory):
+                raise _conflict(record, source)
+            record = _save(record, "verified")
+        elif record.state == "verified":
+            if mode == "copy" and _matches_data(source, snapshot, is_directory):
+                shutil.rmtree(source) if is_directory else source.unlink()
+            elif mode == "copy" and not _absent(source):
+                raise _conflict(record, source)
+            record = _save(record, "source_removed")
+        elif record.state == "source_removed":
+            destination_matches = _matches_data(destination, snapshot, is_directory)
+            linked_already = (
+                link_back
+                and link_target(source) == destination.resolve(strict=False)
+            )
+            if not destination_matches or not (_absent(source) or linked_already):
+                raise _conflict(record, source, destination)
+            if link_back and not linked_already:
+                make_link(source, destination)
+            record = _save(record, "linked")
+        elif record.state == "linked":
+            if not _matches_data(destination, snapshot, is_directory):
+                raise _conflict(record, destination)
+            if link_back and link_target(source) != destination.resolve(strict=False):
+                raise _conflict(record, source, destination)
+            record = _save(record, "committed")
+        else:
+            raise _conflict(record, source, destination)
+    return record
+
+
+def start_remove(
+    root: Path,
+    config: Config,
+    names: tuple[str, ...],
+    leaf: Path,
+    target: Path,
+    purge: bool,
+) -> OperationRecord:
+    operation_id = new_operation_id()
+    results = section_path(Leaf(names, leaf), config, "results")
+    offloaded = is_offloaded(results)
+    trash = (
+        config.hdd_root
+        / ".trash"
+        / hdd_project_path(config, root).name
+        / operation_id
+    )
+    local_trash = trash / "local"
+    hdd_trash = trash / "hdd"
+    local_snapshot = tree_snapshot_no_follow(leaf, results if offloaded else None)
+    hdd_exists = target.is_dir() and not is_offloaded(target)
+    hdd_snapshot = None
+    if hdd_exists:
+        require_plain_tree(target, "rm")
+        hdd_snapshot = asdict(tree_snapshot(target))
+    record = _new_record(
+        root,
+        "rm",
+        {
+            "names": list(names),
+            "leaf": str(leaf),
+            "target": str(target),
+            "local_trash": str(local_trash),
+            "hdd_trash": str(hdd_trash),
+            "purge": purge,
+            "offloaded": offloaded,
+            "results": str(results),
+            "hdd_root": str(config.hdd_root),
+            "local_snapshot": asdict(local_snapshot),
+            "hdd_existed": hdd_exists,
+            "hdd_snapshot": hdd_snapshot,
+        },
+        operation_id,
+    )
+    if purge:
+        record = replace(record, state="purge_started")
+        save_operation_record(record)
+        if offloaded:
+            remove_link(results)
+        if leaf.is_dir():
+            shutil.rmtree(leaf)
+        if target.is_dir():
+            shutil.rmtree(target)
+        return _save(record, "committed")
+    save_operation_record(record)
+    return continue_remove(record)
+
+
+def continue_remove(record: OperationRecord) -> OperationRecord:
+    leaf = _path(record, "leaf")
+    target = _path(record, "target")
+    local_trash = _path(record, "local_trash")
+    hdd_trash = _path(record, "hdd_trash")
+    local_snapshot = _named_snapshot(record, "local_snapshot")
+    hdd_existed = record.details.get("hdd_existed") is True
+    offloaded = record.details.get("offloaded") is True
+    results = _path(record, "results")
+    hdd_snapshot = (
+        _named_snapshot(record, "hdd_snapshot") if hdd_existed else None
+    )
+    while record.state != "committed":
+        if record.state == "prepared":
+            source_ready = (
+                hdd_snapshot is not None
+                and _matches_tree(target, hdd_snapshot)
+                and _absent(hdd_trash)
+            )
+            next_ready = (
+                hdd_snapshot is not None
+                and _absent(target)
+                and _matches_tree(hdd_trash, hdd_snapshot)
+            )
+            no_hdd = not hdd_existed and _absent(target) and _absent(hdd_trash)
+            if source_ready:
+                hdd_trash.parent.mkdir(parents=True, exist_ok=True)
+                target.rename(hdd_trash)
+            elif not (next_ready or no_hdd):
+                raise _conflict(record, target, hdd_trash)
+            record = _save(record, "hdd_trashed")
+        elif record.state == "hdd_trashed":
+            hdd_ready = (
+                hdd_snapshot is not None
+                and _absent(target)
+                and _matches_tree(hdd_trash, hdd_snapshot)
+                or not hdd_existed
+                and _absent(target)
+                and _absent(hdd_trash)
+            )
+            if offloaded:
+                if link_target(results) == target.resolve(strict=False):
+                    remove_link(results)
+                elif not _absent(results):
+                    raise _conflict(record, results, target)
+            source_ready = _matches_tree_no_follow(
+                leaf, local_snapshot
+            ) and _absent(local_trash)
+            next_ready = _absent(leaf) and _matches_tree_no_follow(
+                local_trash, local_snapshot
+            )
+            if not hdd_ready:
+                raise _conflict(record, target, hdd_trash)
+            if source_ready:
+                local_trash.parent.mkdir(parents=True, exist_ok=True)
+                if same_volume(leaf, local_trash):
+                    leaf.rename(local_trash)
+                else:
+                    copy_tree_verified(leaf, local_trash, "rm")
+                    shutil.rmtree(leaf)
+            elif not next_ready:
+                raise _conflict(record, leaf, local_trash)
+            record = _save(record, "local_trashed")
+        elif record.state == "local_trashed":
+            if not (
+                _absent(leaf)
+                and _matches_tree_no_follow(local_trash, local_snapshot)
+            ):
+                raise _conflict(record, leaf, local_trash)
+            if hdd_existed and (
+                hdd_snapshot is None
+                or not _absent(target)
+                or not _matches_tree(hdd_trash, hdd_snapshot)
+            ):
+                raise _conflict(record, target, hdd_trash)
+            record = _save(record, "committed")
+        else:
+            raise _conflict(record, leaf, target)
+    return record
+
+
+def _continue_operation(record: OperationRecord) -> OperationRecord:
+    continuations = {
+        "offload": continue_offload,
+        "restore": continue_restore,
+        "rename": continue_rename,
+        "adopt": continue_adopt,
+        "rm": continue_remove,
+    }
+    continuation = continuations.get(record.operation_type)
+    if continuation is None:
+        raise DirecteriorError(f"unsupported recovery operation: {record.operation_type}")
+    return continuation(record)
+
+def _move_verified(source: Path, target: Path, is_directory: bool, operation: str) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if same_volume(source, target):
+        source.rename(target)
+        return
+    if is_directory:
+        copy_tree_verified(source, target, operation)
+        shutil.rmtree(source)
+    else:
+        copy_file_verified(source, target, operation)
+        source.unlink()
+
+
+def undo_operation(root: Path, operation_id: str, approved: bool) -> OperationRecord:
     require_approval(approved, "undo")
-    record = load_operation(root, operation_id)
-    if record.state != "applied":
+    records = list_operation_records(root)
+    if operation_id == "latest":
+        record = next(
+            (candidate for candidate in records if candidate.state == "committed"),
+            None,
+        )
+    else:
+        record = next(
+            (candidate for candidate in records if candidate.operation_id == operation_id),
+            None,
+        )
+    if record is None:
+        raise DirecteriorError(f"operation history not found: {operation_id}")
+    if record.state != "committed":
         raise DirecteriorError(f"cannot undo operation in state: {record.state}")
-    _verify(record, "destination")
-    for move in reversed(record.moves):
-        source = Path(move.source)
-        if move.linked_back:
+
+    if record.operation_type == "adopt":
+        source = _path(record, "source")
+        destination = _path(record, "destination")
+        snapshot = _snapshot(record)
+        is_directory = record.details.get("is_directory") is True
+        linked_back = record.details.get("link_intent") is True
+        if not _matches_data(destination, snapshot, is_directory):
+            raise DirecteriorError(f"changed since adopt: {destination}")
+        if linked_back:
+            if link_target(source) != destination.resolve(strict=False):
+                raise DirecteriorError(f"changed since adopt: {source}")
             remove_link(source)
-        source.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(move.destination, move.source)
-        if record.operation_type == "rm":
-            # Only the emptied trash directory may be pruned; a managed section
-            # that happens to be empty must survive.
+        if not _absent(source):
+            raise DirecteriorError(f"restore target already exists: {source}")
+        _move_verified(destination, source, is_directory, "undo adopt")
+    elif record.operation_type == "rm":
+        if record.details.get("purge") is True:
+            raise DirecteriorError("rm --purge is permanently deleted and cannot be undone")
+        leaf = _path(record, "leaf")
+        target = _path(record, "target")
+        local_trash = _path(record, "local_trash")
+        hdd_trash = _path(record, "hdd_trash")
+        local_snapshot = _named_snapshot(record, "local_snapshot")
+        hdd_existed = record.details.get("hdd_existed") is True
+        if not _absent(leaf) or not _matches_tree_no_follow(
+            local_trash, local_snapshot
+        ):
+            raise DirecteriorError(f"changed since rm: {local_trash}")
+        if hdd_existed:
+            hdd_snapshot = _named_snapshot(record, "hdd_snapshot")
+            if not _absent(target) or not _matches_tree(hdd_trash, hdd_snapshot):
+                raise DirecteriorError(f"changed since rm: {hdd_trash}")
+            _move_verified(hdd_trash, target, True, "undo rm")
+        _move_verified(local_trash, leaf, True, "undo rm")
+        if record.details.get("offloaded") is True:
+            results = _path(record, "results")
+            if not _absent(results):
+                raise DirecteriorError(f"restore target already exists: {results}")
+            make_link(results, target)
+        trash_operation = hdd_trash.parent
+        for directory in (
+            local_trash.parent,
+            trash_operation,
+            trash_operation.parent,
+        ):
             with suppress(OSError):
-                Path(move.destination).parent.rmdir()
-    # Verify before relinking: the recorded digest was taken with the offload
-    # link already removed, so recreating it first would never match.
-    _verify(record, "source")
-    if record.relink is not None:
-        link, target = record.relink
-        make_link(Path(link), Path(target))
-    save_operation(replace(record, state="undone"))
+                directory.rmdir()
+    else:
+        raise DirecteriorError(f"undo is unsupported for {record.operation_type}")
+
+    undone = _save(record, "undone")
     print(f"undone {record.operation_type} {record.operation_id}")
-    for move in record.moves:
-        print(f"  restored: {move.source}")
+    return undone
 
 
-def trash_root(hdd_root: Path, project_name: str, operation_id: str) -> Path:
-    return hdd_root / TRASH_DIR / project_name / operation_id
+def recover_operation(
+    root: Path, operation_id: str, approved: bool
+) -> OperationRecord | MigrationRecord:
+    if not approved:
+        raise DirecteriorError(
+            "recover may delete a verified source; pass --yes only AFTER explicit approval"
+        )
+    operations = list_operation_records(root)
+    migrations = list_records(root)
+    candidates: list[OperationRecord | MigrationRecord]
+    if operation_id == "latest":
+        candidates = [
+            *(
+                record
+                for record in operations
+                if record.state not in {"committed", "undone", "purge_started"}
+            ),
+            *(record for record in migrations if record.state == "prepared"),
+        ]
+        if not candidates:
+            raise DirecteriorError("no interrupted operation to recover")
+        record = max(candidates, key=lambda item: item.created_at)
+    else:
+        matches = [
+            *(record for record in operations if record.operation_id == operation_id),
+            *(record for record in migrations if record.operation_id == operation_id),
+        ]
+        if not matches:
+            raise DirecteriorError(f"operation history not found: {operation_id}")
+        record = matches[0]
+    if Path(record.project_root).resolve() != root.resolve():
+        raise DirecteriorError("operation journal belongs to another project")
+    if isinstance(record, MigrationRecord):
+        if record.state != "prepared":
+            raise DirecteriorError(f"cannot recover migration in state: {record.state}")
+        from directerior_migrate import continue_migration
 
-
-def iter_trash(hdd_root: Path, project_name: str) -> list[Path]:
-    base = hdd_root / TRASH_DIR / project_name
-    if not base.is_dir():
-        return []
-    return sorted(path for path in base.iterdir() if path.is_dir())
+        return continue_migration(root, record)
+    if record.state in {"committed", "undone"}:
+        raise DirecteriorError(f"cannot recover an operation in state: {record.state}")
+    if record.state == "purge_started":
+        raise DirecteriorError("rm --purge is intentionally non-recoverable")
+    return _continue_operation(record)

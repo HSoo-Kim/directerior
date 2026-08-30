@@ -89,15 +89,15 @@ Directerior 为**一开始就采用它布局的项目**而设计，因此 `init`
 已经有成熟仓库？保持代码原位，只让 Directerior 管产物：
 
 ```bash
-python scripts/expman.py adopt ./outputs my-method exp01 --link --yes
-python scripts/expman.py offload my-method exp01 --yes
+directerior adopt ./outputs my-method exp01 --link --yes
+directerior offload my-method exp01 --yes
 ```
 
 ## 工作原理
 
 ```
 project/                        # 根目录 = .expman.json 所在位置
-├── .expman.json                # { "hdd_root": "D:/exp-archive", "threshold_mb": 100 }
+├── .expman.json                # schema 2 配置 + 防冲突 project_id
 └── methods/
     └── lora-finetune/          # 一种方法论
         └── experiments/
@@ -112,7 +112,7 @@ project/                        # 根目录 = .expman.json 所在位置
 
 ```
  SSD（快、小）                              HDD（大、宽裕）
- methods/.../exp01/results  ──junction──▶   exp-archive/project/methods/.../exp01/results
+ methods/.../exp01/3_results ──junction──▶ exp-archive/project--project_id/methods/.../exp01/3_results
         ▲
         └─ 代码继续读写这个路径 — 一切照常
 ```
@@ -123,14 +123,16 @@ Windows 上创建 junction **无需管理员权限**；POSIX 上使用 symlink�
 
 ```bash
 cd my-project
-python scripts/expman.py init --hdd-root D:/exp-archive --threshold-mb 100
-python scripts/expman.py new lora-finetune exp01-baseline -d "baseline"
+uv sync
+directerior init --hdd-root D:/exp-archive --threshold-mb 100
+directerior new lora-finetune exp01-baseline -d "baseline"
 
-# ... 运行实验，产物写入 results/ ...
+# ... 运行实验，产物写入 3_results/ ...
 
-python scripts/expman.py scan                  # exit 2 = 存在待迁移项
-python scripts/expman.py offload lora-finetune exp01-baseline --yes
-python scripts/expman.py status
+directerior scan                  # exit 2 = 存在待迁移项
+directerior offload lora-finetune exp01-baseline --yes
+directerior status
+directerior status --verify       # 显式 SHA-256 验证
 ```
 
 ## 自定义层级
@@ -139,15 +141,15 @@ python scripts/expman.py status
 任意层级：
 
 ```bash
-python scripts/expman.py init --hdd-root D:/exp-archive --hierarchy datasets,methods,experiments
-# datasets/<数据集>/methods/<方法论>/experiments/<实验>/{code,results}
+directerior init --hdd-root D:/exp-archive --hierarchy datasets,methods,experiments
+# datasets/<数据集>/methods/<方法论>/experiments/<实验>/{1_plan,2_code,3_results}
 ```
 
 之后每条命令按顺序接收每级一个名称：
 
 ```bash
-python scripts/expman.py new imagenet lora-finetune exp01-baseline
-python scripts/expman.py offload imagenet lora-finetune exp01-baseline --yes
+directerior new imagenet lora-finetune exp01-baseline
+directerior offload imagenet lora-finetune exp01-baseline --yes
 ```
 
 层级保存在 `.expman.json` 中。请在 init 时一次定好 — 数据落地后再改，
@@ -166,12 +168,14 @@ python scripts/expman.py offload imagenet lora-finetune exp01-baseline --yes
 | `rename <旧名称...> --to <新名称...> --yes` | 同步重命名本地 leaf 与 HDD 镜像 |
 | `rm <名称...> --yes [--purge]` | 将本地 leaf 与 HDD 副本移入 HDD 回收站；`--purge` 永久删除 |
 | `adopt <path> <名称...> [--as NAME] [--link] [--allow-breaking-refs] --yes` | 收编位置不对的产物；`--link` 保持原路径可用 |
-| `clean [--fix]` | 清除 HDD 空目录、修复失效链接、报告孤立数据与回收站 |
+| `clean [--fix]` | 仅在精确 HDD 目标存在时修复链接；报告未解决链接、孤立数据与回收站（未解决时 exit 2） |
 | `migrate-layout [--dry-run] --yes` | 预览变化或转换编号结构 |
-| `history [--json]` | 显示可逆操作记录（迁移、`adopt`、`rm`） |
-| `undo [ID|latest] --yes` | 严格验证后回滚迁移、`adopt` 或 `rm` |
+| `upgrade-config --yes [--allow-dirty]` | 在全部结果恢复后显式升级至 schema 2 并分配唯一 project ID |
+| `history [--json]` | 显示已完成及中断的迁移和路径操作日志 |
+| `recover [ID|latest] --yes` | 验证文件系统状态并继续中断的正向操作 |
+| `undo [ID|latest] --yes` | 回滚 committed 迁移、`adopt` 或非 purge `rm` |
 | `redo [ID|latest] --yes` | 重新应用已 undo 的迁移 |
-| `status [--json]` | 每个实验：字节数与 local/HDD 位置 |
+| `status [--json] [--verify]` | 默认仅统计元数据；`--verify` 添加 SHA-256 验证与 digest |
 
 所有重新定位数据的命令还接受 `--allow-dirty`（见下文）。
 
@@ -217,36 +221,23 @@ ERROR: moving /home/me/proj/outputs would break 2 reference(s):
 默认仅用数字：`1_baseline`、`2_training`。同一第 1 阶段出现并行分支时才
 扩展为 `1_a_baseline`、`1_b_augmented`。`add` 自动计算下一个前缀。
 
-## 严格可逆操作
+## 严格可逆与可恢复操作
 
-日志保存在项目之外的用户状态目录，因此恢复后的项目内不会残留记账文件。
-同一个 `history` 下共存两类记录：
+Schema-3 日志保存在项目之外的用户状态目录。`history` 同时显示已完成和中断的操作。
 
-| 类别 | 命令 | 验证 | 回滚 |
-|---|---|---|---|
-| migration | `migrate-layout` | SHA-256 内容全量 | `undo` + `redo` |
-| path operation | `adopt`、`rm` | 路径/大小结构 | `undo`（重新执行命令即可重做） |
+`offload`、`restore`、`rename`、`adopt`、`rm`、`migrate-layout` 会记录每次
+文件系统状态转换。若进程中断于数据移动和日志写入之间，
+`recover [ID|latest] --yes` 会验证路径、snapshot 与链接目标，只继续此前批准的
+正向操作。当前状态若既不匹配记录状态，也不精确匹配其下一状态，则报告冲突，
+绝不猜测或覆盖。
 
-`rm` 不再删除，而是将实验及其 HDD 副本移至
-`<hdd_root>/.trash/<项目>/<操作-id>/`，`undo` 连同 offload 链接一并还原。
-真正销毁数据的只有 `--purge`。
+`undo` 只接受 committed 记录。迁移支持 `undo`/`redo`；`adopt` 和非 purge
+`rm` 支持 `undo`。`rm` 将数据移至
+`<hdd_root>/.trash/<project--project_id>/<操作-id>/`。`rm --purge` 永久删除
+数据，保留诊断日志，但不可撤销。
 
-undo/redo 前会验证 `.expman.json`
-原始字节、每个相关文件的路径/大小/SHA-256、空目录、HDD 位置和 junction
-状态。任何内容变化都会在移动前拒绝。成功 undo 会恢复原名称、文件字节、
-配置格式、HDD 路径与链接；仅外部日志保留，以便 redo。
-
-schema v2 日志同时也是未来 version graph 的 edge：
-
-```text
-parent_id -> operation_id
-before_fingerprint -> after_fingerprint
-operation_type = migrate_layout
-```
-
-fingerprint 描述项目状态而非命令文字，因此未来 rename、offload 等操作可在前一
-操作结果与下一操作输入相同时连接到同一 graph。旧 schema v1 日志仍可读取；
-Directerior 会在加载时推导缺失的 fingerprint。
+旧配置保持可读并继续使用 `<hdd_root>/<项目名>/`。只有全部 offload 结果恢复后，
+`upgrade-config --yes` 才会分配 schema-2 project ID。
 
 ## 团队使用
 
@@ -258,15 +249,17 @@ set EXPMAN_HDD_ROOT=E:\my-archive      # Windows
 export EXPMAN_HDD_ROOT=/mnt/archive    # POSIX
 ```
 
-迁移数据存放于 `<hdd_root>/<项目名>/…`，一块归档盘可服务多个项目而互不冲突。
+Schema-2 项目使用 `<hdd_root>/<项目名>--<project_id>/…`，同名项目也拥有不同的归档命名空间。
 
 ## 安全不变式
 
-- `offload`、`restore`、`rename`、`rm`、`adopt`、`migrate-layout`、`undo`、
-  `redo` **没有 `--yes`
-  一律失败** — 删除源数据或重新定位必须经用户批准
+- `offload`、`restore`、`rename`、`rm`、`adopt`、`migrate-layout`、`recover`、
+  `undo`、`redo` **没有 `--yes` 一律失败** — 删除源数据、重新定位或恢复继续
+  都必须经用户批准
 - offload/restore 按复制 → SHA-256 全树验证 → 删除源数据执行；
   空间不足时在复制前中止
+- 普通 `scan` 与 `status` 只读取元数据；仅 `status --verify` 执行 SHA-256 验证
+- HDD 目标缺失时 `clean --fix` 不会创建空目录；未解决链接或孤立数据仍返回 exit 2
 - **绝不改写源代码** — 会被破坏的引用只报告并拒绝，交由您处理
 - **智能体指令文件**（`AGENTS.md`、`CLAUDE.md`、`.claude/` …）不作为移动或删除目标
 - 已跟踪文件处于修改状态时，需 `--allow-dirty` 才能重新定位

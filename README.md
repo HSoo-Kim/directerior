@@ -105,15 +105,15 @@ Already have a mature repository? Keep the code where it is and let
 Directerior manage only the artifacts:
 
 ```bash
-python scripts/expman.py adopt ./outputs my-method exp01 --link --yes
-python scripts/expman.py offload my-method exp01 --yes
+directerior adopt ./outputs my-method exp01 --link --yes
+directerior offload my-method exp01 --yes
 ```
 
 ## How it works
 
 ```
 project/                        # root = where .expman.json lives
-├── .expman.json                # { "hdd_root": "D:/exp-archive", "threshold_mb": 100 }
+├── .expman.json                # schema 2 config + collision-resistant project_id
 └── methods/
     └── lora-finetune/          # one methodology
         └── experiments/
@@ -128,7 +128,7 @@ When `results/` grows past the threshold and you approve the offload:
 
 ```
  SSD (fast, small)                          HDD (big, roomy)
- methods/.../exp01/results  ──junction──▶   exp-archive/project/methods/.../exp01/results
+ methods/.../exp01/3_results ──junction──▶ exp-archive/project--project_id/methods/.../exp01/3_results
         ▲
         └─ your code keeps reading/writing this exact path — nothing breaks
 ```
@@ -139,14 +139,16 @@ Junctions need **no admin rights** on Windows; POSIX uses symlinks.
 
 ```bash
 cd my-project
-python scripts/expman.py init --hdd-root D:/exp-archive --threshold-mb 100
-python scripts/expman.py new lora-finetune exp01-baseline -d "baseline"
+uv sync
+directerior init --hdd-root D:/exp-archive --threshold-mb 100
+directerior new lora-finetune exp01-baseline -d "baseline"
 
-# ... run experiments, write outputs to results/ ...
+# ... run experiments, write outputs to 3_results/ ...
 
-python scripts/expman.py scan                  # exit 2 = offload candidates
-python scripts/expman.py offload lora-finetune exp01-baseline --yes
-python scripts/expman.py status
+directerior scan                  # exit 2 = offload candidates
+directerior offload lora-finetune exp01-baseline --yes
+directerior status
+directerior status --verify       # opt-in SHA-256 digest
 ```
 
 ## Custom hierarchy
@@ -155,15 +157,15 @@ Two levels (`methods` → `experiments`) is the default, not the limit — defin
 any hierarchy at init:
 
 ```bash
-python scripts/expman.py init --hdd-root D:/exp-archive --hierarchy datasets,methods,experiments
-# datasets/<dataset>/methods/<method>/experiments/<experiment>/{code,results}
+directerior init --hdd-root D:/exp-archive --hierarchy datasets,methods,experiments
+# datasets/<dataset>/methods/<method>/experiments/<experiment>/{1_plan,2_code,3_results}
 ```
 
 Every command then takes one name per level, in order:
 
 ```bash
-python scripts/expman.py new imagenet lora-finetune exp01-baseline
-python scripts/expman.py offload imagenet lora-finetune exp01-baseline --yes
+directerior new imagenet lora-finetune exp01-baseline
+directerior offload imagenet lora-finetune exp01-baseline --yes
 ```
 
 The hierarchy is stored in `.expman.json`. Pick it once at init — changing it
@@ -182,12 +184,14 @@ after data exists means migrating directories manually.
 | `rename <old...> --to <new...> --yes` | rename local leaf and HDD mirror together |
 | `rm <name...> --yes [--purge]` | move local leaf and HDD copy to the HDD trash; `--purge` deletes permanently |
 | `adopt <path> <name...> [--as NAME] [--link] [--allow-breaking-refs] --yes` | bring an out-of-place output under management; `--link` keeps the original path alive |
-| `clean [--fix]` | prune empty HDD dirs, repair broken links, report orphans and trash |
+| `clean [--fix]` | repair only links whose exact HDD target exists; report unresolved broken links, orphans, and trash (exit 2 while unresolved) |
 | `migrate-layout [--dry-run] --yes` | preview or convert legacy leaves |
-| `history [--json]` | list reversible operations (migrations, `adopt`, `rm`) |
-| `undo [ID|latest] --yes` | strictly reverse a migration, an `adopt`, or an `rm` |
+| `upgrade-config --yes [--allow-dirty]` | explicitly upgrade a restored legacy project to schema 2 and assign a project ID |
+| `history [--json]` | list migrations and path-operation journals, including interruptions |
+| `recover [ID|latest] --yes` | verify filesystem state and resume an interrupted forward operation |
+| `undo [ID|latest] --yes` | strictly reverse a committed migration, `adopt`, or non-purge `rm` |
 | `redo [ID|latest] --yes` | strictly reapply an undone migration |
-| `status [--json]` | every experiment: bytes and local/HDD location |
+| `status [--json] [--verify]` | metadata-only sizes by default; opt-in SHA-256 verification and digest |
 
 Every data-relocating command also accepts `--allow-dirty` (see below).
 
@@ -239,47 +243,29 @@ Numbering stays simple until complexity needs subdivision:
 `1_baseline`, `2_training`; parallel variants under stage 1 become
 `1_a_baseline`, `1_b_augmented`. `add` calculates these prefixes.
 
-## Strictly reversible operations
+## Strictly reversible and recoverable operations
 
-Journals live **outside the project** in the user's Directerior state
-directory, so undo leaves no bookkeeping files inside the restored project.
-Two kinds share one `history`:
+Schema-3 journals live **outside the project** in the user's Directerior state
+directory, so recovery metadata does not alter the managed tree. `history`
+shows both completed and interrupted operations.
 
-| Kind | Commands | Verification | Reversal |
-|---|---|---|---|
-| migration | `migrate-layout` | full SHA-256 content | `undo` + `redo` |
-| path operation | `adopt`, `rm` | path/size structure | `undo` (re-run to reapply) |
+`offload`, `restore`, `rename`, `adopt`, `rm`, and `migrate-layout` record each
+filesystem transition. If a process stops between a data move and its journal
+write, `recover [ID|latest] --yes` accepts only the recorded state or its exact
+immediate successor, then resumes the already-approved forward operation. A
+snapshot, path, or link-target mismatch is a conflict; Directerior does not
+guess or overwrite.
 
-`rm` moves the experiment and its HDD copy to
-`<hdd_root>/.trash/<project>/<operation-id>/` rather than deleting them, and
-`undo` puts them back — offload link included. `--purge` is the only command
-that destroys data outright.
+`undo` accepts only committed records. Migrations support strict `undo` and
+`redo`; `adopt` and non-purge `rm` support strict `undo`. `rm` moves the local
+experiment and any HDD result copy under
+`<hdd_root>/.trash/<project--project_id>/<operation-id>/`. `rm --purge`
+permanently deletes data, records a diagnostic journal, and cannot be undone.
 
-`migrate-layout` first supports `--dry-run`.
-
-Before undo or redo, Directerior verifies:
-
-- exact `.expman.json` bytes;
-- every touched file's relative path, byte size, and SHA-256 content;
-- empty directory structure;
-- local versus HDD location and junction/symlink state.
-
-If anything changed after migration/undo, the command refuses before moving
-anything. Successful undo restores original names, bytes, config formatting,
-HDD paths, and links. `history`, `undo`, and `redo` default to `latest`.
-
-Every schema-v2 journal is also a future version-graph edge:
-
-```text
-parent_id -> operation_id
-before_fingerprint -> after_fingerprint
-operation_type = migrate_layout
-```
-
-Fingerprints describe project state, not command wording, so future rename,
-offload, or layout operations can join the same graph when their resulting
-state matches the next operation's input state. Older schema-v1 journals stay
-readable; Directerior derives missing fingerprints when loading them.
+Legacy configs remain readable and keep the legacy
+`<hdd_root>/<project-name>/` namespace. `upgrade-config --yes` assigns a
+schema-2 project ID only after every offloaded leaf has been restored, avoiding
+an ambiguous archive move.
 
 ## Team usage
 
@@ -291,16 +277,20 @@ set EXPMAN_HDD_ROOT=E:\my-archive      # Windows
 export EXPMAN_HDD_ROOT=/mnt/archive    # POSIX
 ```
 
-Offloaded data lands under `<hdd_root>/<project-name>/…`, so one archive
-drive serves many projects without collisions.
+Schema-2 projects use `<hdd_root>/<project-name>--<project_id>/…`, so projects
+with the same directory name still receive distinct archive namespaces.
 
 ## Safety invariants
 
-- `offload`, `restore`, `rename`, `rm`, `adopt`, `migrate-layout`, `undo`,
-  and `redo` **hard-fail without
-  `--yes`** — every source deletion or relocation requires explicit approval
+- `offload`, `restore`, `rename`, `rm`, `adopt`, `migrate-layout`, `recover`,
+  `undo`, and `redo` **hard-fail without `--yes`** — every source deletion,
+  relocation, or resumed operation requires explicit approval
 - Offload/restore copy first, verify the complete tree by SHA-256, then delete
   source data; insufficient capacity aborts before copying
+- Ordinary `scan` and `status` read metadata only; `status --verify` is the
+  explicit SHA-256 integrity pass
+- `clean --fix` never replaces a missing HDD target with an empty directory;
+  unresolved broken links and orphans remain reported with exit code 2
 - **Source code is never rewritten** — broken references are reported, refused,
   and left to you
 - **Agent instruction files** (`AGENTS.md`, `CLAUDE.md`, `.claude/`, …) are
