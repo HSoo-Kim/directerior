@@ -253,11 +253,49 @@ def start_restore(
     return continue_restore(record)
 
 
+def _preflight_restore(
+    record: OperationRecord,
+    link: Path,
+    source: Path,
+    staging: Path,
+    snapshot: TreeSnapshot,
+) -> None:
+    linked = link_target(link) == source.resolve(strict=False)
+    link_absent = _absent(link)
+    local_ready = _matches_tree(link, snapshot)
+    source_ready = _matches_tree(source, snapshot)
+    staging_ready = _matches_tree(staging, snapshot)
+    staging_absent = _absent(staging)
+    ready = {
+        "prepared": linked
+        and source_ready
+        and (staging_absent or staging_ready),
+        "copied": linked and source_ready and staging_ready,
+        "verified": source_ready
+        and staging_ready
+        and (linked or link_absent),
+        "link_removed": source_ready
+        and (
+            link_absent
+            and staging_ready
+            or local_ready
+            and staging_absent
+        ),
+        "local_installed": local_ready
+        and staging_absent
+        and (source_ready or _absent(source)),
+        "hdd_removed": local_ready and staging_absent and _absent(source),
+    }.get(record.state, False)
+    if not ready:
+        raise _conflict(record, link, source, staging)
+
+
 def continue_restore(record: OperationRecord) -> OperationRecord:
     link = _path(record, "link")
     source = _path(record, "source")
     staging = _path(record, "staging")
     snapshot = _snapshot(record)
+    _preflight_restore(record, link, source, staging, snapshot)
     while record.state != "committed":
         if record.state == "prepared":
             expected_link = link_target(link) == source.resolve(strict=False)
@@ -684,6 +722,57 @@ def start_remove(
     return continue_remove(record)
 
 
+def _preflight_remove(
+    record: OperationRecord,
+    leaf: Path,
+    target: Path,
+    local_trash: Path,
+    hdd_trash: Path,
+    results: Path,
+    local_snapshot: TreeSnapshot,
+    hdd_snapshot: TreeSnapshot | None,
+    hdd_existed: bool,
+    offloaded: bool,
+) -> None:
+    hdd_before = (
+        _matches_tree(target, hdd_snapshot) and _absent(hdd_trash)
+        if hdd_existed and hdd_snapshot is not None
+        else _absent(target) and _absent(hdd_trash)
+    )
+    hdd_after = (
+        _absent(target) and _matches_tree(hdd_trash, hdd_snapshot)
+        if hdd_existed and hdd_snapshot is not None
+        else _absent(target) and _absent(hdd_trash)
+    )
+    local_linked = (
+        _matches_tree_no_follow_excluding(leaf, local_snapshot, results)
+        and link_target(results) == target.resolve(strict=False)
+        if offloaded
+        else _matches_tree_no_follow(leaf, local_snapshot)
+    )
+    local_unlinked = (
+        offloaded
+        and _matches_tree_no_follow_excluding(leaf, local_snapshot, results)
+        and _absent(results)
+    )
+    local_before = (
+        (local_linked or local_unlinked)
+        and _absent(local_trash)
+    )
+    local_after = _absent(leaf) and _matches_tree_no_follow(
+        local_trash, local_snapshot
+    )
+    ready = {
+        "prepared": (hdd_before or hdd_after)
+        and local_linked
+        and _absent(local_trash),
+        "hdd_trashed": hdd_after and (local_before or local_after),
+        "local_trashed": hdd_after and local_after,
+    }.get(record.state, False)
+    if not ready:
+        raise _conflict(record, leaf, target, local_trash, hdd_trash, results)
+
+
 def continue_remove(record: OperationRecord) -> OperationRecord:
     leaf = _path(record, "leaf")
     target = _path(record, "target")
@@ -695,6 +784,18 @@ def continue_remove(record: OperationRecord) -> OperationRecord:
     results = _path(record, "results")
     hdd_snapshot = (
         _named_snapshot(record, "hdd_snapshot") if hdd_existed else None
+    )
+    _preflight_remove(
+        record,
+        leaf,
+        target,
+        local_trash,
+        hdd_trash,
+        results,
+        local_snapshot,
+        hdd_snapshot,
+        hdd_existed,
+        offloaded,
     )
     while record.state != "committed":
         if record.state == "prepared":

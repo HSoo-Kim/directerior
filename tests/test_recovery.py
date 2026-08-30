@@ -110,6 +110,47 @@ def test_restore_recovers_after_each_boundary(
     assert (results / "data.bin").read_bytes() == b"payload"
 
 
+def test_restore_preflight_refuses_changed_source_without_mutation(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("DIRECTERIOR_STATE_HOME", str(tmp_path / "state"))
+    results = project / "methods" / "lora" / "experiments" / "exp01" / "results"
+    (results / "data.bin").write_bytes(b"payload")
+    offload(["lora", "exp01"], True)
+    _fail_after_state(monkeypatch, "link_removed")
+
+    with pytest.raises(InjectedFailure):
+        restore(["lora", "exp01"], True)
+
+    interrupted = _latest(project)
+    assert interrupted.state == "verified"
+    source = Path(str(interrupted.details["source"]))
+    staging = Path(str(interrupted.details["staging"]))
+    (source / "data.bin").write_bytes(b"changed")
+    positions = (
+        results.exists(),
+        directerior_ops.is_offloaded(results),
+        source.exists(),
+        staging.exists(),
+    )
+
+    with pytest.raises(DirecteriorError, match="recovery conflict"):
+        recover_operation(project, interrupted.operation_id, True)
+
+    assert (
+        results.exists(),
+        directerior_ops.is_offloaded(results),
+        source.exists(),
+        staging.exists(),
+    ) == positions
+    assert (source / "data.bin").read_bytes() == b"changed"
+    assert (staging / "data.bin").read_bytes() == b"payload"
+    assert _latest(project).state == "verified"
+
+
+
+
 @pytest.mark.parametrize("state", RENAME_STATES)
 def test_rename_recovers_after_each_boundary(
     project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
@@ -269,6 +310,53 @@ def test_cross_volume_adopt_recovers_after_each_boundary(
     assert recovered.state == "committed"
     assert (destination / "data.bin").read_bytes() == b"payload"
     assert (source / "data.bin").read_bytes() == b"payload"
+
+
+def test_remove_preflight_refuses_changed_local_tree_without_mutation(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("DIRECTERIOR_STATE_HOME", str(tmp_path / "state"))
+    leaf = project / "methods" / "lora" / "experiments" / "exp01"
+    results = leaf / "results"
+    code = leaf / "code" / "train.py"
+    code.write_bytes(b"original")
+    (results / "data.bin").write_bytes(b"payload")
+    offload(["lora", "exp01"], True)
+    _fail_after_state(monkeypatch, "hdd_trashed")
+
+    with pytest.raises(InjectedFailure):
+        remove_experiment(["lora", "exp01"], True)
+
+    interrupted = _latest(project)
+    assert interrupted.state == "prepared"
+    target = Path(str(interrupted.details["target"]))
+    hdd_trash = Path(str(interrupted.details["hdd_trash"]))
+    local_trash = Path(str(interrupted.details["local_trash"]))
+    expected_link = directerior_ops.link_target(results)
+    code.write_bytes(b"changed")
+    positions = (
+        leaf.exists(),
+        target.exists(),
+        hdd_trash.exists(),
+        local_trash.exists(),
+        directerior_ops.link_target(results),
+    )
+
+    with pytest.raises(DirecteriorError, match="recovery conflict"):
+        recover_operation(project, interrupted.operation_id, True)
+
+    assert (
+        leaf.exists(),
+        target.exists(),
+        hdd_trash.exists(),
+        local_trash.exists(),
+        directerior_ops.link_target(results),
+    ) == positions
+    assert directerior_ops.link_target(results) == expected_link
+    assert code.read_bytes() == b"changed"
+    assert (hdd_trash / "data.bin").read_bytes() == b"payload"
+    assert _latest(project).state == "prepared"
 
 
 @pytest.mark.parametrize("state", ["prepared", "hdd_trashed", "local_trashed"])
