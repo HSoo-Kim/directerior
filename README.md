@@ -243,6 +243,19 @@ Numbering stays simple until complexity needs subdivision:
 `1_baseline`, `2_training`; parallel variants under stage 1 become
 `1_a_baseline`, `1_b_augmented`. `add` calculates these prefixes.
 
+For directories an agent creates outside Directerior's fixed experiment
+containers, use a numeric ordering prefix and a purpose-specific name at every
+level. Numbering restarts within each parent: `0_reference/`,
+`1_analysis/1_functional-states-manuscript-review/`, and
+`1_validation/`. Name a directory for the research activity or deliverable,
+not the tool that produced it; avoid generic names such as `work`, `misc`, or
+`outputs`. Keep all source specifications, deliverables, and validation
+evidence for one request beneath that request's numbered directory.
+
+Directerior itself is for experiments and experiment outputs. Do not create a
+fake method or `expNN-*` leaf for a manuscript review, one-off analysis,
+report, presentation, or documentation deliverable.
+
 ## Strictly reversible and recoverable operations
 
 Schema-3 journals live **outside the project** in the user's Directerior state

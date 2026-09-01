@@ -1,6 +1,6 @@
 ---
 name: directerior
-description: Lightweight per-method/per-experiment directory manager with HDD offload for large results. Recommended for projects it lays out from the start; it moves directories but never rewrites source code, imports, or agent instruction files. MUST USE when creating a new experiment, organizing experiment outputs, when results/artifacts pile up in a research project, when the user wants their own directory scheme, or when outputs land in unexpected paths. Manages a configurable hierarchy (default methods/<method>/experiments/<experiment>) of {code,results} dirs, scans results dirs against a size threshold (default 100MB), and - ONLY after explicit user approval - moves oversized results to a configured HDD and junction-links them back so code paths keep working. Adopts out-of-place outputs after asking the user, repairs broken links, prunes empty HDD dirs. Triggers: directerior, new experiment, organize experiments, experiment directory, results too big, offload results, move results to HDD, restore results, adopt outputs, unexpected output path, experiment status, clean experiment dirs, 실험 디렉토리, 실험 정리, 결과물 정리, 결과물 HDD 이동, 방법론별 실험 관리, 예상치 못한 경로, custom hierarchy, directory scheme, 계층 구조, 원하는 디렉토리 구조.
+description: Lightweight per-method/per-experiment directory manager with HDD offload for large results. Recommended for experiment projects it lays out from the start; it moves directories but never rewrites source code, imports, or agent instruction files. MUST USE when creating a new experiment, organizing experiment outputs, when experiment results/artifacts pile up, or when experiment outputs land in unexpected paths. Do not initialize Directerior for a one-off analysis, document review, presentation, report, or other non-experiment deliverable. Manages a configurable hierarchy (default methods/<method>/experiments/<experiment>) of {code,results} dirs, scans results dirs against a size threshold (default 100MB), and - ONLY after explicit user approval - moves oversized results to a configured HDD and junction-links them back so code paths keep working. Adopts out-of-place experiment outputs after asking the user, repairs broken links, prunes empty HDD dirs. Triggers: directerior, new experiment, organize experiments, experiment directory, experiment results too big, offload results, move results to HDD, restore results, adopt experiment outputs, unexpected experiment output path, experiment status, clean experiment dirs, 실험 디렉토리, 실험 정리, 실험 결과물 정리, 실험 결과물 HDD 이동, 방법론별 실험 관리.
 ---
 
 # directerior
@@ -22,6 +22,10 @@ Directerior moves directories. It never changes the meaning of a file.
   do not silently rewrite their paths.
 - **Never restructures an existing codebase.** `init` refuses a directory that
   already holds a real source tree.
+- **Never disguises non-experiment work as an experiment.** A manuscript
+  review, one-off analysis, report, presentation, or documentation artifact
+  stays in the project's purpose-oriented directory tree. Do not create a
+  fake method or `expNN-*` leaf merely to make Directerior manage it.
 
 Moving code is cheap; keeping every import, hardcoded path, SUMO/Hydra config,
 notebook, and shell script in sync with the move is not. Directerior manages
@@ -69,6 +73,9 @@ The two levels above are the default. `.expman.json` may define any hierarchy
 below then takes one name per level, in order.
 
 Rules for the agent:
+- Before `init` or `new`, classify the requested work. Continue with
+  Directerior only when the work is an actual experiment or experiment-output
+  management task.
 - Experiment code goes in `code/`, every generated artifact goes in `results/`.
   Never write outputs to the project root or into `code/`.
 - Name methods after the methodology, experiments as `expNN-<short-slug>`.
@@ -193,6 +200,26 @@ explicit path to schema 2 and refuses until all offloaded leaves are restored.
 
 ## Adaptive numbering
 
+- Every visible directory authored by the agent MUST have an ordering prefix:
+  `0_reference`, `1_analysis`, `1_manuscript-review`, `2_model-calibration`,
+  `1_validation`. Numbering restarts within each parent and follows the
+  existing sibling order.
+- Directory names MUST describe the directory's purpose or research activity,
+  not the tool used to create it. Prefer
+  `1_functional-states-manuscript-review` over `1_archify-output`, and
+  `2_flood-traffic-calibration` over a generic `2_work` or `2_results`.
+- Build the hierarchy from purpose to task to artifacts. First select the
+  correct numbered purpose category, then create one numbered directory for
+  the request beneath it, and keep all resulting sources, deliverables, and
+  validation evidence inside that request directory.
+- Keep every artifact produced for one request beneath that request's numbered
+  directory. Do not split its source and deliverables across unrelated
+  top-level directories.
+- Use `0_` for immutable inputs or references when that convention fits the
+  project. Use `1_`, `2_`, ... for ordered work and output directories.
+- Directerior's fixed structural containers and external/user-owned paths are
+  exceptions: do not rename `.git`, `.github`, configured hierarchy container
+  names, or pre-existing directories merely to enforce this convention.
 - Simple sequence: `1_plan`, `2_code`, `3_results`; files such as
   `1_objective.md`, `2_hypotheses.md`.
 - Parallel variants inside logical stage N: `N_a_<slug>`, `N_b_<slug>`, ...

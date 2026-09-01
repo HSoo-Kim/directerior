@@ -221,6 +221,16 @@ ERROR: moving /home/me/proj/outputs would break 2 reference(s):
 默认仅用数字：`1_baseline`、`2_training`。同一第 1 阶段出现并行分支时才
 扩展为 `1_a_baseline`、`1_b_augmented`。`add` 自动计算下一个前缀。
 
+当代理在 Directerior 的固定实验容器之外创建目录时，每一层都应使用数字顺序
+前缀和能够说明目的的名称。编号在每个父目录下重新开始，例如
+`0_reference/`、`1_analysis/1_functional-states-manuscript-review/` 和
+`1_validation/`。目录名称应描述研究活动或交付物的目的，而不是生成它的工具；
+避免 `work`、`misc`、`outputs` 等含糊名称。同一请求产生的源规范、交付物和
+验证证据应全部放在该请求带编号的目录下。
+
+Directerior 本身只用于实验和实验输出。不要为了管理论文审阅、一次性分析、
+报告、演示文稿或文档交付物而创建虚假的方法或 `expNN-*` 目录。
+
 ## 严格可逆与可恢复操作
 
 Schema-3 日志保存在项目之外的用户状态目录。`history` 同时显示已完成和中断的操作。
