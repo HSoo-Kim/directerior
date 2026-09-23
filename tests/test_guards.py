@@ -69,6 +69,36 @@ def test_adopt_reports_breaking_references_and_moves_nothing(tmp_path: Path) -> 
     assert (outputs / "run.log").is_file()
 
 
+def test_adopt_detects_backslash_spelled_references(tmp_path: Path) -> None:
+    root, _hdd, env = new_project(tmp_path)
+    outputs = root / "old" / "outputs"
+    outputs.mkdir(parents=True)
+    (outputs / "run.log").write_text("done\n", encoding="utf-8")
+    (root / "train.py").write_text('OUT = r"old\\outputs\\run.log"\n', encoding="utf-8")
+
+    completed = run_cli(root, "adopt", "old/outputs", "lora", "exp01", "--yes", env=env)
+
+    assert completed.returncode == 1
+    assert "train.py:1" in completed.stderr
+    assert (outputs / "run.log").is_file()
+
+
+def test_adopt_rejects_destination_name_that_is_a_path(tmp_path: Path) -> None:
+    root, _hdd, env = new_project(tmp_path)
+    outputs = root / "outputs"
+    outputs.mkdir()
+    escaped = tmp_path / "escaped"
+
+    completed = run_cli(
+        root, "adopt", "outputs", "lora", "exp01", "--as", str(escaped), "--yes", env=env
+    )
+
+    assert completed.returncode == 1
+    assert "--as" in completed.stderr
+    assert outputs.is_dir()
+    assert not escaped.exists()
+
+
 def test_adopt_link_back_skips_the_reference_guard(tmp_path: Path) -> None:
     # Given
     root, _hdd, env = new_project(tmp_path)

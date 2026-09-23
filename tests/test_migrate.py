@@ -480,3 +480,59 @@ def test_multileaf_migration_recovers_second_leaf_then_undoes_and_redoes(
     assert (project / ".expman.json").read_bytes() == after_config
     assert link_target(second / "3_results") == new_target.resolve()
     assert (second / "3_results" / "artifact.bin").read_bytes() == b"payload-two"
+
+
+def test_interrupted_redo_is_recoverable(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(project)
+    leaf = project / "methods" / "lora" / "experiments" / "exp01"
+    (leaf / "code" / "train.py").write_bytes(b"code")
+    migrate_layout(True)
+    operation_id = load_record(project, "latest").operation_id
+    undo_migration(operation_id, True)
+    original_save = directerior_migrate.save_record
+
+    def fail_at_first_checkpoint(record: MigrationRecord) -> None:
+        if record.leaf_state == "plan_created":
+            raise RuntimeError("injected redo interruption")
+        original_save(record)
+
+    monkeypatch.setattr(directerior_migrate, "save_record", fail_at_first_checkpoint)
+    with pytest.raises(RuntimeError, match="injected redo interruption"):
+        redo_migration(operation_id, True)
+    monkeypatch.setattr(directerior_migrate, "save_record", original_save)
+
+    recovered = recover_operation(project, "latest", True)
+
+    assert recovered.state == "committed"
+    assert (leaf / "2_code" / "train.py").read_bytes() == b"code"
+    assert json.loads((project / ".expman.json").read_text())["sections"]["code"] == "2_code"
+
+
+def test_history_tolerates_legacy_path_operation_journal(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from directerior_history import project_history_dir
+
+    monkeypatch.setenv("DIRECTERIOR_STATE_HOME", str(tmp_path / "state"))
+    directory = project_history_dir(project)
+    directory.mkdir(parents=True)
+    legacy = {
+        "schema": 2,
+        "kind": "path_op",
+        "id": "20260827T000000000000Z-deadbeef",
+        "operation_id": "20260827T000000000000Z-deadbeef",
+        "state": "applied",
+        "operation_type": "adopt",
+        "project_root": str(project),
+        "created_at": "2026-08-27T00:00:00+00:00",
+        "git_head": None,
+        "moves": [],
+        "relink": None,
+    }
+    (directory / f"{legacy['id']}.json").write_text(json.dumps(legacy), encoding="utf-8")
+
+    completed = run_cli(project, "history")
+
+    assert completed.returncode == 0, completed.stderr

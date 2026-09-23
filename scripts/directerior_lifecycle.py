@@ -195,16 +195,25 @@ def clean(fix: bool) -> int:
             unresolved += 1
             print(f"BROKEN LINK: {leaf.label}; expected target missing: {expected}")
 
+    result_targets: set[Path] = set()
     for _names, target in _hdd_result_paths(root, config):
+        result_targets.add(target)
         if target.resolve(strict=False) in managed_targets:
             continue
         unresolved += 1
         print(f"ORPHAN ON HDD: {target}")
 
+    # Prune only the hierarchy scaffolding around result trees. Empty
+    # directories inside a results tree are user data and part of its digest.
     if hdd_project.is_dir():
-        for directory, _subdirs, _files in os.walk(hdd_project, topdown=False):
+        containers: list[Path] = []
+        for directory, subdirs, _files in os.walk(hdd_project):
+            base = Path(directory)
+            subdirs[:] = [name for name in subdirs if base / name not in result_targets]
+            containers.append(base)
+        for directory in reversed(containers):
             with suppress(OSError):
-                Path(directory).rmdir()
+                directory.rmdir()
 
     trash_roots = (
         config.hdd_root / ".trash" / hdd_project.name,

@@ -62,7 +62,7 @@ def find_root(start: Path | None = None) -> Path:
     )
 
 
-def _validate_component(value: object, field: str) -> str:
+def validate_component(value: object, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise DirecteriorError(f"{field} must be a non-empty path component")
     if (
@@ -80,11 +80,10 @@ def validate_config(raw: object, root: Path) -> Config:
     if not isinstance(raw, dict):
         raise DirecteriorError(f"{CONFIG_NAME} must contain a JSON object")
 
-    schema_raw = raw.get("schema")
-    if schema_raw is None:
+    if "schema" not in raw:
         schema = 1
         project_id = None
-    elif schema_raw == 2 and not isinstance(schema_raw, bool):
+    elif type(raw["schema"]) is int and raw["schema"] == 2:
         schema = 2
         project_id_raw = raw.get("project_id")
         if not isinstance(project_id_raw, str) or re.fullmatch(
@@ -93,7 +92,7 @@ def validate_config(raw: object, root: Path) -> Config:
             raise DirecteriorError("schema 2 requires a 12-character lowercase hex project_id")
         project_id = project_id_raw
     else:
-        raise DirecteriorError(f"unsupported config schema: {schema_raw!r}")
+        raise DirecteriorError(f"unsupported config schema: {raw['schema']!r}")
 
     hdd_raw = os.environ.get("EXPMAN_HDD_ROOT", raw.get("hdd_root"))
     if not isinstance(hdd_raw, str) or not hdd_raw.strip() or "\x00" in hdd_raw:
@@ -113,10 +112,11 @@ def validate_config(raw: object, root: Path) -> Config:
     if not isinstance(hierarchy_raw, list) or not hierarchy_raw:
         raise DirecteriorError("hierarchy must be a non-empty list")
     hierarchy = tuple(
-        _validate_component(value, f"hierarchy[{index}]")
+        validate_component(value, f"hierarchy[{index}]")
         for index, value in enumerate(hierarchy_raw)
     )
-    if len(set(hierarchy)) != len(hierarchy):
+    # Case-insensitive filesystems (Windows, macOS) treat `Part` and `PART` as one name.
+    if len({level.casefold() for level in hierarchy}) != len(hierarchy):
         raise DirecteriorError("hierarchy level names must be unique")
 
     sections_raw = raw.get("sections")
@@ -132,10 +132,10 @@ def validate_config(raw: object, root: Path) -> Config:
         }:
             raise DirecteriorError("sections must define exactly plan, code, and results")
         sections = {
-            name: _validate_component(sections_raw[name], f"sections.{name}")
+            name: validate_component(sections_raw[name], f"sections.{name}")
             for name in ("plan", "code", "results")
         }
-        if len(set(sections.values())) != len(sections):
+        if len({value.casefold() for value in sections.values()}) != len(sections):
             raise DirecteriorError("section directory names must be unique")
 
     return Config(
@@ -163,7 +163,7 @@ def parse_names(config: Config, names: list[str]) -> tuple[str, ...]:
             f"{len(config.hierarchy)} name(s), got {len(names)}: {' '.join(names)}"
         )
     for index, name in enumerate(names):
-        _validate_component(name, f"name[{index}]")
+        validate_component(name, f"name[{index}]")
     return tuple(names)
 
 
@@ -174,10 +174,19 @@ def leaf_relative(config: Config, names: tuple[str, ...]) -> Path:
     return path
 
 
+def require_inside_root(root: Path, path: Path) -> None:
+    """Refuse leaf paths redirected outside the project by a linked container."""
+    resolved_root = root.resolve()
+    resolved = path.resolve(strict=False)
+    if resolved != resolved_root and resolved_root not in resolved.parents:
+        raise DirecteriorError(f"refusing path that resolves outside the project: {path}")
+
+
 def require_leaf(root: Path, config: Config, names: tuple[str, ...]) -> Leaf:
     path = root / leaf_relative(config, names)
     if not path.is_dir():
         raise DirecteriorError(f"not found: {path}")
+    require_inside_root(root, path)
     return Leaf(names=names, path=path)
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import date
 from pathlib import Path
@@ -17,9 +18,11 @@ from directerior_core import (
     leaf_relative,
     load_config,
     parse_names,
+    require_inside_root,
     require_leaf,
     scaffold_plan,
     section_path,
+    validate_component,
     validate_config,
     write_manifest,
 )
@@ -29,10 +32,11 @@ from directerior_guards import (
     require_no_agent_assets,
     require_no_breaking_references,
 )
-from directerior_ops import start_adopt
+from directerior_ops import interrupted_records, start_adopt
 from directerior_storage import (
     directory_size,
     is_offloaded,
+    link_target,
     require_plain_tree,
     tree_snapshot,
 )
@@ -88,6 +92,13 @@ def upgrade_config(approved: bool, allow_dirty: bool) -> None:
         raise DirecteriorError(
             "upgrade-config refuses while results are offloaded; restore offloaded leaves first"
         )
+    # Interrupted journals record paths in the current HDD namespace.
+    pending = [record.operation_id for record in interrupted_records(root)]
+    if pending:
+        raise DirecteriorError(
+            "upgrade-config refuses while operations are interrupted; "
+            f"run 'directerior recover <id> --yes' first: {', '.join(pending)}"
+        )
     require_clean_worktree(root, "upgrade-config", allow_dirty)
     raw = json.loads((root / CONFIG_NAME).read_text(encoding="utf-8"))
     raw.update(
@@ -115,6 +126,7 @@ def create_experiment(names_raw: list[str], description: str) -> None:
     path = root / leaf_relative(config, names)
     if path.exists():
         raise DirecteriorError(f"already exists: {path}")
+    require_inside_root(root, path)
     leaf = Leaf(names=names, path=path)
     scaffold_plan(section_path(leaf, config, "plan"))
     section_path(leaf, config, "code").mkdir()
@@ -165,6 +177,10 @@ def status_entries(
         if verify:
             if not selected.is_dir():
                 raise DirecteriorError(f"status --verify path is missing: {selected}")
+            if location == "hdd" and link_target(results) != selected.resolve(strict=False):
+                raise DirecteriorError(
+                    f"status --verify: {results} does not link to expected target {selected}"
+                )
             require_plain_tree(selected, "status --verify")
             snapshot = tree_snapshot(selected)
             entry["verified"] = True
@@ -201,6 +217,8 @@ def adopt_output(
     require_no_agent_assets(source, "adopt")
     if link_back and not source.is_dir():
         raise DirecteriorError("--link works for directories only")
+    if destination_name:
+        validate_component(destination_name, "--as")
     destination = destination_root / (destination_name or source.name)
     if destination.exists() or is_offloaded(destination):
         raise DirecteriorError(f"destination already exists: {destination}")
@@ -231,6 +249,13 @@ def _alpha_label(index: int) -> str:
     return label
 
 
+def _alpha_index(label: str) -> int:
+    index = 0
+    for char in label:
+        index = index * 26 + ord(char) - ord("a") + 1
+    return index
+
+
 def add_numbered(parent_raw: str, slug: str, group: int | None, file: bool) -> None:
     root = find_root()
     parent = (root / parent_raw).resolve()
@@ -249,13 +274,14 @@ def add_numbered(parent_raw: str, slug: str, group: int | None, file: bool) -> N
         ]
         prefix = str(max(numbers, default=0) + 1)
     else:
-        marker = f"{group}_"
-        variants = sorted(
-            name[len(marker) :].split("_", 1)[0]
+        # Variant labels are the generated a..z, aa..zz; anything longer is a slug.
+        variant = re.compile(rf"{group}_([a-z]{{1,2}})_")
+        used = [
+            _alpha_index(match.group(1))
             for name in names
-            if name.startswith(marker) and "_" in name[len(marker) :]
-        )
-        prefix = f"{group}_{_alpha_label(len(variants) + 1)}"
+            if (match := variant.match(name)) is not None
+        ]
+        prefix = f"{group}_{_alpha_label(max(used, default=0) + 1)}"
     target = parent / f"{prefix}_{slug}"
     if file:
         target.touch(exist_ok=False)

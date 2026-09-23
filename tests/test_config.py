@@ -52,6 +52,12 @@ def _schema_two_without_sections(raw: dict[str, object]) -> None:
         ),
         (
             lambda raw: raw.update(
+                sections={"plan": "Part", "code": "PART", "results": "3_results"}
+            ),
+            "must be unique",
+        ),
+        (
+            lambda raw: raw.update(
                 sections={"plan": "", "code": "2_code", "results": "3_results"}
             ),
             "non-empty path component",
@@ -61,6 +67,8 @@ def _schema_two_without_sections(raw: dict[str, object]) -> None:
             "exactly plan, code, and results",
         ),
         (lambda raw: raw.update(schema=9), "unsupported config schema"),
+        (lambda raw: raw.update(schema=None), "unsupported config schema"),
+        (lambda raw: raw.update(schema=2.0, project_id="0123456789ab"), "unsupported"),
         (lambda raw: raw.update(schema=2, project_id="BAD"), "project_id"),
         (_schema_two_without_sections, "explicit plan, code, and results sections"),
     ],
@@ -151,3 +159,45 @@ def test_upgrade_refuses_while_results_are_offloaded(
     assert result.returncode == 1
     assert "restore offloaded leaves first" in result.stderr
     assert load_config(root).schema == 1
+
+
+def test_upgrade_refuses_while_an_operation_is_interrupted(
+    numbered_project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import directerior_ops
+    from directerior_lifecycle import offload
+
+    monkeypatch.chdir(numbered_project)
+    results = numbered_project / "methods" / "lora" / "experiments" / "exp01" / "3_results"
+    (results / "data.bin").write_bytes(b"payload")
+    original = directerior_ops.save_operation_record
+
+    def save_then_fail(record: directerior_ops.OperationRecord) -> None:
+        original(record)
+        if record.state == "copied":
+            raise RuntimeError("crash after copy")
+
+    monkeypatch.setattr(directerior_ops, "save_operation_record", save_then_fail)
+    with pytest.raises(RuntimeError):
+        offload(["lora", "exp01"], True)
+
+    result = run_cli(numbered_project, "upgrade-config", "--yes", "--allow-dirty")
+
+    assert result.returncode == 1
+    assert "operations are interrupted" in result.stderr
+    assert load_config(numbered_project).schema == 1
+
+
+def test_new_refuses_hierarchy_container_linked_outside_project(
+    numbered_project: Path, tmp_path: Path
+) -> None:
+    outside = tmp_path / "outside-methods"
+    outside.mkdir()
+    shutil.rmtree(numbered_project / "methods")
+    make_link(numbered_project / "methods", outside)
+
+    result = run_cli(numbered_project, "new", "m", "e")
+
+    assert result.returncode == 1
+    assert "outside the project" in result.stderr
+    assert list(outside.iterdir()) == []

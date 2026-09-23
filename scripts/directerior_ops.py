@@ -637,6 +637,10 @@ def continue_adopt(record: OperationRecord) -> OperationRecord:
                 raise _conflict(record, source)
             record = _save(record, "verified")
         elif record.state == "verified":
+            # Never delete the source unless the destination still holds a
+            # verified copy: it may have changed between states.
+            if not _matches_data(destination, snapshot, is_directory):
+                raise _conflict(record, source, destination)
             if mode == "copy" and _matches_data(source, snapshot, is_directory):
                 shutil.rmtree(source) if is_directory else source.unlink()
             elif mode == "copy" and not _absent(source):
@@ -689,6 +693,10 @@ def start_remove(
     if hdd_exists:
         require_plain_tree(target, "rm")
         hdd_snapshot = asdict(tree_snapshot(target))
+    if not purge and not same_volume(leaf, local_trash):
+        # A cross-volume trash move is a verified copy, which cannot carry
+        # nested links; refuse before the HDD copy or managed link is touched.
+        require_plain_tree(leaf, "rm", results if offloaded else None)
     record = _new_record(
         root,
         "rm",
@@ -971,6 +979,19 @@ def undo_operation(root: Path, operation_id: str, approved: bool) -> OperationRe
     return undone
 
 
+def interrupted_records(root: Path) -> list[OperationRecord | MigrationRecord]:
+    """Journals that `recover` can still resume, newest first."""
+    records: list[OperationRecord | MigrationRecord] = [
+        *(
+            record
+            for record in list_operation_records(root)
+            if record.state not in {"committed", "undone", "purge_started"}
+        ),
+        *(record for record in list_records(root) if record.state == "prepared"),
+    ]
+    return sorted(records, key=lambda item: item.created_at, reverse=True)
+
+
 def recover_operation(
     root: Path, operation_id: str, approved: bool
 ) -> OperationRecord | MigrationRecord:
@@ -978,22 +999,15 @@ def recover_operation(
         raise DirecteriorError(
             "recover may delete a verified source; pass --yes only AFTER explicit approval"
         )
-    operations = list_operation_records(root)
-    migrations = list_records(root)
-    candidates: list[OperationRecord | MigrationRecord]
+    record: OperationRecord | MigrationRecord
     if operation_id == "latest":
-        candidates = [
-            *(
-                record
-                for record in operations
-                if record.state not in {"committed", "undone", "purge_started"}
-            ),
-            *(record for record in migrations if record.state == "prepared"),
-        ]
+        candidates = interrupted_records(root)
         if not candidates:
             raise DirecteriorError("no interrupted operation to recover")
-        record = max(candidates, key=lambda item: item.created_at)
+        record = candidates[0]
     else:
+        operations = list_operation_records(root)
+        migrations = list_records(root)
         matches = [
             *(record for record in operations if record.operation_id == operation_id),
             *(record for record in migrations if record.operation_id == operation_id),

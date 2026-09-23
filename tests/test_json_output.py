@@ -68,3 +68,20 @@ def test_status_verify_reports_digest_without_changing_byte_meanings(project: Pa
     assert verified["stored_bytes"] == normal["stored_bytes"]
     assert verified["verified"] is True
     assert len(verified["digest"]) == 64
+
+
+def test_status_verify_rejects_link_to_unexpected_target(project: Path, tmp_path: Path) -> None:
+    from directerior_storage import make_link, remove_link
+
+    results = project / "methods" / "lora" / "experiments" / "exp01" / "results"
+    (results / "artifact.bin").write_bytes(b"payload")
+    assert run_cli(project, "offload", "lora", "exp01", "--yes").returncode == 0
+    stray = tmp_path / "stray"
+    stray.mkdir()
+    remove_link(results)
+    make_link(results, stray)
+
+    completed = run_cli(project, "status", "--verify")
+
+    assert completed.returncode == 1
+    assert "does not link to expected target" in completed.stderr

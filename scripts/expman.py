@@ -175,7 +175,10 @@ def run(arguments: argparse.Namespace) -> int:
                 print(json.dumps({"threshold_mb": config.threshold_mb, "entries": entries}))
             else:
                 for entry in entries:
-                    print(f"{entry['label']}  {entry['location']}  {entry['bytes']} bytes")
+                    line = f"{entry['label']}  {entry['location']}  {entry['bytes']} bytes"
+                    if arguments.verify:
+                        line += f"  verified sha256={entry['digest']}"
+                    print(line)
         case "offload":
             offload(arguments.names, arguments.yes, arguments.allow_dirty)
         case "restore":

@@ -82,6 +82,25 @@ def test_clean_fix_reports_regular_directory_conflict(numbered_project: Path) ->
     assert (target / "remote.bin").read_bytes() == b"remote"
 
 
+def test_clean_keeps_empty_directories_inside_offloaded_results(
+    numbered_project: Path,
+) -> None:
+    results, target = _paths(numbered_project)
+    (results / "checkpoints").mkdir()
+    (results / "log.txt").write_text("x", encoding="utf-8")
+    assert run_cli(numbered_project, "offload", "lora", "exp01", "--yes").returncode == 0
+    (target / "log.txt").unlink()
+    stale_container = target.parents[1] / "exp-stale"
+    stale_container.mkdir()
+
+    result = run_cli(numbered_project, "clean")
+
+    assert result.returncode == 0
+    assert (target / "checkpoints").is_dir()
+    assert link_target(results) == target.resolve()
+    assert not stale_container.exists()
+
+
 def test_clean_preserves_and_reports_trash(numbered_project: Path) -> None:
     _results, target = _paths(numbered_project)
     operation = target.parents[5] / ".trash" / numbered_project.name / "op-123"

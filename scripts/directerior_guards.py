@@ -8,6 +8,7 @@ git as the transaction boundary for projects that have one.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from collections.abc import Iterator, Sequence
 from pathlib import Path
@@ -201,11 +202,13 @@ def _is_probably_text(path: Path) -> bool:
 
 
 def reference_needles(root: Path, source: Path, section: str) -> list[str]:
-    needles: list[str] = []
     try:
-        needles.append(source.relative_to(root).as_posix())
+        spelled = source.relative_to(root).as_posix()
     except ValueError:
-        needles.append(source.as_posix())
+        spelled = source.as_posix()
+    # Windows code spells paths with `\` (and `\\` inside string literals).
+    spellings = [spelled, spelled.replace("/", "\\"), spelled.replace("/", "\\\\")]
+    needles = list(dict.fromkeys(spellings))
     if section != "results" and source.suffix == ".py":
         needles.extend([f"import {source.stem}", f"from {source.stem}"])
     return needles
@@ -216,6 +219,8 @@ def find_references(
     needles: Sequence[str],
     skip_roots: Sequence[Path],
 ) -> list[str]:
+    fold = os.name == "nt"  # NTFS paths are case-insensitive
+    wanted = [needle.casefold() for needle in needles] if fold else list(needles)
     resolved_skips = [path.resolve() for path in skip_roots]
     hits: list[str] = []
     for path in iter_project_files(root):
@@ -229,7 +234,8 @@ def find_references(
         except OSError:
             continue
         for number, line in enumerate(lines, start=1):
-            if any(needle in line for needle in needles):
+            haystack = line.casefold() if fold else line
+            if any(needle in haystack for needle in wanted):
                 hits.append(f"{path.relative_to(root).as_posix()}:{number}: {line.strip()[:100]}")
                 if len(hits) >= MAX_REPORTED_REFERENCES:
                     return hits

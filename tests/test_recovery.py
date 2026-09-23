@@ -10,6 +10,7 @@ from directerior_history import OperationRecord, list_operation_records
 from directerior_lifecycle import offload, remove_experiment, rename_experiment, restore
 from directerior_ops import recover_operation
 from directerior_project import adopt_output
+from directerior_storage import link_target, make_link
 
 
 class InjectedFailure(RuntimeError):
@@ -312,6 +313,34 @@ def test_cross_volume_adopt_recovers_after_each_boundary(
     assert (source / "data.bin").read_bytes() == b"payload"
 
 
+def test_cross_volume_adopt_recovery_keeps_source_when_copy_changed(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(project)
+    source = tmp_path / "outside"
+    source.mkdir()
+    (source / "data.bin").write_bytes(b"payload")
+    monkeypatch.setattr(directerior_ops, "same_volume", lambda *_args: False)
+    original = directerior_ops.save_operation_record
+
+    def save_then_fail(record: OperationRecord) -> None:
+        original(record)
+        if record.state == "verified":
+            raise InjectedFailure("after saved verified")
+
+    monkeypatch.setattr(directerior_ops, "save_operation_record", save_then_fail)
+    with pytest.raises(InjectedFailure):
+        adopt_output(str(source), ["lora", "exp01"], "adopted", False, True, "results")
+    monkeypatch.setattr(directerior_ops, "save_operation_record", original)
+    destination = project / "methods" / "lora" / "experiments" / "exp01" / "results" / "adopted"
+    (destination / "data.bin").write_bytes(b"corrupted")
+
+    with pytest.raises(DirecteriorError):
+        recover_operation(project, _latest(project).operation_id, True)
+
+    assert (source / "data.bin").read_bytes() == b"payload"
+
+
 def test_remove_preflight_refuses_changed_local_tree_without_mutation(
     project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -398,6 +427,27 @@ def test_cross_volume_remove_recovers_after_verified_copy(
     assert not leaf.exists()
     assert (local_trash / "results" / "data.bin").read_bytes() == b"payload"
     assert copy_calls == 1
+
+
+def test_cross_volume_remove_refuses_nested_link_before_touching_offload(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(project)
+    leaf = project / "methods" / "lora" / "experiments" / "exp01"
+    (leaf / "results" / "data.bin").write_bytes(b"payload")
+    offload(["lora", "exp01"], True)
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    make_link(leaf / "code" / "dataset", dataset)
+    target = link_target(leaf / "results")
+    assert target is not None
+    monkeypatch.setattr(directerior_ops, "same_volume", lambda *_args: False)
+
+    with pytest.raises(DirecteriorError, match="nested link"):
+        remove_experiment(["lora", "exp01"], True)
+
+    assert link_target(leaf / "results") == target
+    assert (target / "data.bin").read_bytes() == b"payload"
 
 
 def test_offloaded_remove_recovers_after_saved_hdd_trashed_state(

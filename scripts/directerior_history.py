@@ -232,7 +232,8 @@ def list_records(root: Path) -> list[MigrationRecord]:
     records: list[MigrationRecord] = []
     for path in sorted(directory.glob("*.json"), reverse=True):
         raw = json.loads(path.read_text(encoding="utf-8"))
-        if raw.get("schema") == 3 and "details" in raw:
+        # Path-operation journals (schema 3, or 0.2.0 `path_op`) are not migrations.
+        if "details" in raw or raw.get("kind", "migration") != "migration":
             continue
         leaves = tuple(
             LeafMigration(

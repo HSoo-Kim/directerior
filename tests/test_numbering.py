@@ -35,3 +35,15 @@ def test_add_uses_alpha_suffix_for_parallel_group(project: Path) -> None:
     assert second.returncode == 0
     assert (parent / "1_a_baseline").is_dir()
     assert (parent / "1_b_ablation").is_dir()
+
+
+def test_add_group_ignores_plain_numbered_slugs(project: Path) -> None:
+    parent = project / "variants"
+    parent.mkdir()
+    (parent / "1_baseline_v2").mkdir()
+    (parent / "1_a_first").mkdir()
+
+    completed = run_cli(project, "add", "variants", "next", "--group", "1")
+
+    assert completed.returncode == 0
+    assert (parent / "1_b_next").is_dir()

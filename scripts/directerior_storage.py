@@ -147,7 +147,7 @@ def directory_size(path: Path) -> int:
     return total
 
 
-def require_plain_tree(path: Path, operation: str) -> None:
+def require_plain_tree(path: Path, operation: str, exclude: Path | None = None) -> None:
     pending = [path]
     while pending:
         current = pending.pop()
@@ -158,6 +158,8 @@ def require_plain_tree(path: Path, operation: str) -> None:
         with entries:
             for entry in entries:
                 entry_path = Path(entry.path)
+                if entry_path == exclude:
+                    continue
                 if _entry_is_link(entry):
                     raise DirecteriorError(
                         f"{operation} refuses nested link/reparse point: {entry_path}"

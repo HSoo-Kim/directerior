@@ -569,14 +569,14 @@ def redo_migration(operation_id: str, approved: bool) -> None:
     if record.state != "undone":
         raise DirecteriorError(f"cannot redo migration in state: {record.state}")
     _verify_undone(root, record)
-    committed = continue_migration(
-        root,
-        replace(
-            record,
-            state="prepared",
-            next_leaf_index=0,
-            leaf_state="prepared",
-            after_fingerprint="",
-        ),
+    # Persist the reset before the first mutation so `recover` can resume it.
+    prepared = replace(
+        record,
+        state="prepared",
+        next_leaf_index=0,
+        leaf_state="prepared",
+        after_fingerprint="",
     )
+    save_record(prepared)
+    committed = continue_migration(root, prepared)
     print(f"redone migration {committed.operation_id}")
